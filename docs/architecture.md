@@ -111,7 +111,7 @@ sequenceDiagram
         end
     end
     R-->>S: text, tool status, cards stream back
-    S-->>I: SSE; speech synthesized and played
+    S-->>I: SSE, then speech synthesized and played
     R->>M: after the turn: remember, fix, safety net
 ```
 
