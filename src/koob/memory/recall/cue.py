@@ -109,8 +109,14 @@ def turn_day(now: str | None) -> date:
         return datetime.now().astimezone().date()
 
 
-def parse_dates(text: str, *, now: str | None) -> list[str]:
-    """Day or `start..end` spans the words name, resolved with the turn clock."""
+AHEAD_MONTHS = 3  # a month name this close ahead may mean the coming one («где будет в ноябре»)
+
+
+def parse_dates(text: str, *, now: str | None, ahead: bool = False) -> list[str]:
+    """Day or `start..end` spans the words name, resolved with the turn clock. A bare month
+    name means its last occurrence; with `ahead` (the words are not in the past tense) a
+    month at most AHEAD_MONTHS ahead also gives its coming span, second, so a question
+    about a plan («куда летит в ноябре») meets it and the past reading keeps first place."""
     t = text.casefold()
     today = turn_day(now)
     out: list[str] = []
@@ -167,6 +173,8 @@ def parse_dates(text: str, *, now: str | None) -> list[str]:
         if mon and mon not in days_named:
             year = today.year if mon <= today.month else today.year - 1
             add(*_month_span(year, mon))
+            if ahead and 0 < (mon - today.month) % 12 <= AHEAD_MONTHS:
+                add(*_month_span(today.year + (mon < today.month), mon))
     for m in _SEASON_RX.finditer(t):
         key = _SEASON_EN.get(m.group(1), m.group(1)[:4].rstrip("о"))
         key = next((k for k in _SEASONS if key.startswith(k)), "")
@@ -423,7 +431,8 @@ def parse(turn: TurnCtx, *, now: str, conn: sqlite3.Connection | None = None) ->
     for eid in _kin_entities(conn, rels):
         names.setdefault(eid, KIN_SCORE)
     ids = sorted(names, key=lambda e: (-names[e], e))
-    dates = parse_dates(text, now=now) if text else []
+    past = policy._hits(ws, _PAST_LEX)
+    dates = parse_dates(text, now=now, ahead=not past) if text else []
     scope: dict[str, str] = {"thread": turn.thread_id}
     if ids:
         scope["people"] = ",".join(ids)
@@ -446,5 +455,5 @@ def parse(turn: TurnCtx, *, now: str, conn: sqlite3.Connection | None = None) ->
         relations=rels,
         value_types=value_types_of(ws),
         self_ref=policy._hits(ws, _SELF_LEX),
-        past=policy._hits(ws, _PAST_LEX),
+        past=past,
     )

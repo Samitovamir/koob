@@ -264,12 +264,39 @@ def _recheck(
             )
 
 
+def _asks_relation(row: dict[str, Any], cue: cue_mod.Cue, day: str) -> bool:
+    """The question asks for this fact's relation, in any language: a relation word of the
+    cue («летит», "trip" → travels_to) is the fact's relation; or, when the question names
+    no relation, its question word's value type («где» → place) is the relation's value
+    type and the fact holds in the asked period (no period: on the turn's day, so a future
+    trip does not answer «где он теперь»). `other` carries no relation to ask for."""
+    rel = row.get("relation")
+    if row.get("kind") != "fact" or not rel or rel == "other":
+        return False
+    if rel in cue.relations:
+        return True
+    if cue.relations or not (row.get("value_type") and row["value_type"] in cue.value_types):
+        return False
+    a0, a1 = row.get("valid_from"), row.get("valid_to")
+    if cue.dates:
+        return any(_overlap(a0, a1, span) is not False for span in cue.dates[:2])
+    return (not a0 or str(a0)[:10] <= day) and (not a1 or str(a1)[:10] >= day)
+
+
 def _recheck_targets(
-    conn: sqlite3.Connection, turn: TurnCtx, verdicts: dict[str, policy.Use], cue: cue_mod.Cue
+    conn: sqlite3.Connection,
+    turn: TurnCtx,
+    verdicts: dict[str, policy.Use],
+    cue: cue_mod.Cue,
+    rows: dict[str, dict[str, Any]] | None = None,
+    day: str = "",
 ) -> None:
     """§5.5 «direct question» by target: another person's item their words did not name
     literally is re-decided with the question's target resolved to its entity by the cue
-    (a nickname, the other script, a declined form). The topic test does not change."""
+    (a nickname, the other script, a declined form). The topic test does not change, except
+    for the open-topic labels (third-party private, unknown): their topic is the item's own
+    words, and a question that asks the named subject's fact by its relation («куда Шурик
+    летит» → "Sasha is flying to Seoul") asks those words in any language."""
     if not cue.entity_ids:
         return
     redo = [
@@ -277,9 +304,18 @@ def _recheck_targets(
     ]
     if not redo:
         return
+    targets = set(cue.entity_ids)
     for i, v in policy.decide_targeted(conn, redo, turn, cue.entity_ids).items():
         if v.allowed:
             verdicts[i] = v
+            continue
+        row = (rows or {}).get(i)
+        if v.reason != "name_only" or row is None or row.get("subject_id") not in targets:
+            continue
+        sens = Label(int(row.get("labels") or 0)) & policy.sensitive_mask()
+        if sens & ~policy.OPEN_TOPIC or not _asks_relation(row, cue, day):
+            continue  # health, money, minors …: a relation word is no topic word for them
+        verdicts[i] = policy.Use(True, "direct_relation", hold=cue.send_turn)
 
 
 def _older_impressions(
@@ -673,7 +709,7 @@ def _retired_stems(conn, rows: dict[str, dict[str, Any]]) -> None:
 _REC_SQL = (
     "SELECT r.id, r.kind, r.version, r.status, r.review, r.author_tier, r.pinned_category, r.labels,"
     " r.recorded_at, f.subject_id, f.relation, f.valid_from, f.valid_to, f.applicability,"
-    " f.keywords_ru, rel.cardinality, f.fkind,"
+    " f.keywords_ru, rel.cardinality, rel.value_type, f.fkind,"
     " f.keywords_en, f.quote_orig, f.value_text, i.quote_orig AS i_quote,"
     " i.about_entity_id, i.observed_at, e.span_start,"
     " ae.display_name AS author_name, coalesce(f.text_en, i.text_en, d.chosen_text,"
@@ -1202,7 +1238,7 @@ def assemble(conn: sqlite3.Connection, turn: TurnCtx, *, now: str | None = None)
     verdicts = policy.decide_many(conn, ids, turn) if ids else {}
     rel_evidence = {i for i, sc in lanes.get("relation", []) if sc >= REL_EVIDENCE}
     _recheck(rows, verdicts, lane_of, cue, stems, rel_evidence)
-    _recheck_targets(conn, turn, verdicts, cue)
+    _recheck_targets(conn, turn, verdicts, cue, rows, now[:10])
     ids = [i for i in ids if verdicts[i].allowed]
     timings["use_now"] = _ms(t)
 

@@ -1150,6 +1150,41 @@ def _applies(item: _Src, ws: list[str], turn_dom: set[str] | None = None) -> boo
     return _overlap(_terms(item.text), ws)
 
 
+_NOT_WHO = ("place", "org", "matter", "thing")  # entity types that are what, not who
+
+
+def _topic_exclude(
+    conn: sqlite3.Connection,
+    subjects: tuple[str, ...],
+    ws: list[str],
+    targets: frozenset[str],
+    subject_names: list[str],
+) -> list[str]:
+    """The names an open-topic overlap may not count: a name alone unlocks nothing (§5.5).
+    When their words name a person (or pet) among the item's subjects, only the named people's
+    names stay out: a place or an organisation the item is about («Сплин», "Seoul") is then
+    what the user asks about, and an alias the extractor gave it from a plain word («билеты») is
+    no name of whom the user asks. Without a named person every subject name stays out."""
+    ids = [s for s in dict.fromkeys(subjects) if s]
+    if len(ids) < 2:
+        return subject_names
+    try:
+        what = {
+            r[0]
+            for r in conn.execute(
+                f"SELECT id FROM entities WHERE id IN ({_in(len(ids))})"  # noqa: S608
+                f" AND etype IN ({_in(len(_NOT_WHO))})",
+                [*ids, *_NOT_WHO],
+            )
+        }
+    except sqlite3.Error:
+        return subject_names
+    people = [
+        e for e in ids if e not in what and (e in targets or names_in(ws, _entity_names(conn, [e])))
+    ]
+    return _entity_names(conn, people) if people else subject_names
+
+
 def _asked(held: Label, ws: list[str], item: _Src, names_: list[str]) -> bool:
     terms = _terms(item.text)
     return all(topic_hit(b, ws, item_terms=terms, exclude=names_) for b in bits(held))
@@ -1185,7 +1220,8 @@ def _decide(
     else:
         subject_names = _entity_names(conn, item.subjects)
         terms = _terms(item.text)
-        topic = all(topic_hit(b, ws, item_terms=terms, exclude=subject_names) for b in bits(sens))
+        excl = _topic_exclude(conn, item.subjects, ws, targets, subject_names)
+        topic = all(topic_hit(b, ws, item_terms=terms, exclude=excl) for b in bits(sens))
         # the question's target resolved to its entity (aliases, nicknames, the other script)
         # names the subject as well as the user's literal words do; the topic test stays (§5.5)
         named = names_in(ws, subject_names) or bool(targets & set(item.subjects))

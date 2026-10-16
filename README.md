@@ -1,6 +1,6 @@
 # Koob
 
-A personal assistant for macOS that lives in the MacBook notch, talks by text and voice, and has hands on the Mac: it sees the screen, drives other apps, and opens its own task windows. This repository publishes the parts of it that are about trust: the safety gate around every tool call, the text sanitizer, and the long-term memory engine.
+A personal assistant for macOS that lives in the MacBook notch, talks by text and voice, and has hands on the Mac: it sees the screen, drives other apps, and opens its own task windows. This repository publishes the long-term memory engine and the text sanitizer, and documents the security model around every tool call.
 
 <!-- DEMO: docs/media/demo video goes here -->
 
@@ -33,7 +33,7 @@ Selected components of Koob, exported from the private codebase. The macOS islan
 | `src/koob/sanitize.py` | Untrusted text to bounded plain text: HTML stripping, Unicode normalization, injection flags, secret redaction |
 | `src/koob/memory/` | The memory engine: SQLite ledger, admission policy, writers, recall, forgetting, evaluation harness |
 | `migrations/memory/` | The memory schema |
-| `tests/` | Guard, sanitizer, and memory tests |
+| `tests/` | Sanitizer and memory tests |
 
 Not here yet: the safety gate (`guard.py`) and its tests, because the gate is still wired to the author's own accounts, sites and folders and is being generalized for other users; [docs/security-model.md](docs/security-model.md) describes how it works. The memory engine is here without its sensitivity labeler (`labeler.py`), whose example phrases are being rewritten. The code is published for reading; the memory package has no imports outside itself, which a test enforces.
 
@@ -44,7 +44,7 @@ flowchart LR
     U["User"] --> I["Island app (macOS, private)"]
     I -->|"HTTP + SSE on localhost"| S["Local server (private)"]
     S --> R["Agent runtime: Claude via the Agent SDK (private)"]
-    R -->|"every tool call"| G["Guard (public)"]
+    R -->|"every tool call"| G["Guard (private for now)"]
     G -->|"allow"| T["Tools: files, sandboxed shell, hands, web reader (private)"]
     G -->|"ask"| U
     T -->|"foreign text"| Z["Sanitize (public)"]
