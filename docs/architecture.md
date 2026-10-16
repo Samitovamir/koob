@@ -23,7 +23,7 @@ flowchart TB
         claude["Claude via the Claude Agent SDK, one session per conversation"]
     end
 
-    subgraph gate["Guard (public)"]
+    subgraph gate["Guard (private for now)"]
         verdict["tool_verdict: allow / ask / refuse"]
     end
 
@@ -65,7 +65,7 @@ FastAPI, listening on 127.0.0.1 only. It owns the conversation routes and the st
 
 One turn is one call into the runtime. A router first tries to answer in code (no model). If the ask needs a model, a small local model gives an instant first line where that is reliable, and the conversation's Claude Agent SDK session is resumed with the core context and recalled memory. Koob's own tools are served to the session over MCP. Every tool call the model makes passes through the guard in the SDK's pre-tool-use hook before it runs.
 
-### Guard (public)
+### Guard (private for now)
 
 `guard.py` (not published yet). `tool_verdict(tool_name, tool_input, state, target)` is the single entry point. It returns a `Verdict` with a decision (`allow`, `ask`, `override`, `deny`) and a reason in plain words, tracks per-conversation taint (foreign text, a look at the screen, speech in the room), and judges each action against the user's own words. See [security-model.md](security-model.md).
 
