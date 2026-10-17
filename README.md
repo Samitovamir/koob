@@ -21,7 +21,6 @@ An assistant with hands on a personal Mac reads a lot of text that is not the us
 - **Foreign text gives no orders.** After foreign text enters a conversation, the gate compares each outward or irreversible step against the user's own words; a step the user did not order, or a recipient the user did not point to, goes back to the user first.
 - **Secrets never reach the model.** Secret files, keychains, password managers, and browser credential stores are refused even on the user's order; secrets are redacted on every text path; the shell runs in a macOS Seatbelt sandbox that cannot read them. The user types passwords and captchas.
 - **Money is the one always-confirmed action.** Everything else the user orders runs at once with a one-line report and an Undo where possible. A payment, transfer, or paid subscription always stops for an editable confirmation.
-- **Graded exams are off-limits.** While a graded test is in front, every tool is refused; practice is unlimited.
 
 The full threat model, with what is enforced in code and what is prompt-level policy, is in [docs/security-model.md](docs/security-model.md).
 

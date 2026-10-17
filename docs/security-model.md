@@ -18,7 +18,6 @@ Two words used throughout:
 | The user's money | A payment, transfer, or paid subscription without the user deciding | A page's "subscribe" button, a checkout flow reached during a task |
 | Other people's data and the user's private folders | The assistant reads mail, messages, bank, medical, or private folders the user did not ask it to open | A task wanders; a background wake reads what it was not told to |
 | The integrity of the assistant itself | The model edits its own rules, the gate, or persistence (launch agents, shell profiles) | A model error or an injected instruction |
-| Academic integrity | The assistant helps on a graded exam | A graded test is open on screen during a conversation |
 
 The attacker model is prompt injection by anyone who can get text in front of the assistant, plus ordinary model error. The user is trusted: the user's own words are the permission. The protections do not try to protect the user from themselves, with one exception (money) and a small floor that holds even against the user's order.
 
@@ -78,13 +77,12 @@ Koob does not pile up confirmation dialogs. On the user's own turn, what the use
 
 **Enforced in code** (`guard.py`): `tool_verdict()` is the single entry point, called from the pre-tool-use hook of the Agent SDK. Its pipeline, in order:
 
-1. `graded.guard_floor()`: the exam floor (section 6). A deny here stops everything.
-2. `_tool_verdict()` and `_floor_holds()`: the per-tool classification (`_by_tool()`, `bash_verdict()`, `script_verdict()`, `code_verdict()`, `path_verdict()`, `site_verdict()`) into one of four decisions: `allow`, `ask`, `override` (an action a project rule forbids, named by the rule), or `deny`.
-3. `screen_gate()` and `taint_gate()`: the after-a-look and after-foreign-text rules (section 2.3).
-4. `on_order()`: on the user's own turn, every reason in `WORD_REASONS` (delete, install, send, network, system settings, the app's own code, personal folders the user pointed at, automation, hands, and so on) is answered by the gate itself with `auto=True`; the reason is kept for the step list and the log. What is never answered by the gate is `ALWAYS_ASK`: the money card, the tripwire reasons, the user's own "show me, do not send", and a calendar event.
-5. `apply_pass()`: a task's standing order grants reasons from `PASSABLE` and nothing else; `NEVER_PASSABLE` (every floor reason, the tripwire, memory writes, facts about the user, money, an unknown tool) is never set aside by a task.
-6. `apply_auto()`: the remaining asks that the one behavior mode answers.
-7. `permanent_delete_floor()`: a delete past the Trash runs only when the user said so in words; a plain "delete" means the Trash.
+1. `_tool_verdict()` and `_floor_holds()`: the per-tool classification (`_by_tool()`, `bash_verdict()`, `script_verdict()`, `code_verdict()`, `path_verdict()`, `site_verdict()`) into one of four decisions: `allow`, `ask`, `override` (an action a project rule forbids, named by the rule), or `deny`.
+2. `screen_gate()` and `taint_gate()`: the after-a-look and after-foreign-text rules (section 2.3).
+3. `on_order()`: on the user's own turn, every reason in `WORD_REASONS` (delete, install, send, network, system settings, the app's own code, personal folders the user pointed at, automation, hands, and so on) is answered by the gate itself with `auto=True`; the reason is kept for the step list and the log. What is never answered by the gate is `ALWAYS_ASK`: the money card, the tripwire reasons, the user's own "show me, do not send", and a calendar event.
+4. `apply_pass()`: a task's standing order grants reasons from `PASSABLE` and nothing else; `NEVER_PASSABLE` (every floor reason, the tripwire, memory writes, facts about the user, money, an unknown tool) is never set aside by a task.
+5. `apply_auto()`: the remaining asks that the one behavior mode answers.
+6. `permanent_delete_floor()`: a delete past the Trash runs only when the user said so in words; a plain "delete" means the Trash.
 
 On a turn that is not the user's (a scheduled wake, a task's own opening or report), the reasons in `BACKGROUND_ASK` stay questions; nothing runs in the background that the user did not order.
 
@@ -94,19 +92,13 @@ On a turn that is not the user's (a scheduled wake, a task's own opening or repo
 
 **Enforced in code** (`guard.py`): `R_PAY` is in `ALWAYS_ASK` and `NEVER_PASSABLE`. Money is recognized by money context, not by a verb: `_pays()` looks for a pay verb next to a price or a currency; `_pay_host()` for checkout, billing, and payment hosts; `_presses_pay_button()` and `_page_js_pays()` for a click, a Return, or a script on a checkout or subscribe page; `_pay_call()` for a payment call from the shell. A free "subscribe" is not money. Inside a task, `pay_matches()` and `step_amounts()` let a standing order cover a payment only step by step, when the task's own card names the merchant and a maximum. The confirmation card is editable before it runs.
 
-## 6. Graded exams are off-limits
-
-**Enforced in code:** `tool_verdict()` calls the graded-test floor first. While a graded test is in front (detected from the synced course item, the quiz address, the window title, or a lockdown browser), every tool returns a `deny`, which no mode, override, or pass reaches; only stopping and the voice settings are left. The eyes never look at such a window and the hands never touch it. The classifier itself lives in the private learning module; the call site is the first line of `tool_verdict()`.
-
-**Policy:** practice and preparation are unlimited; the persona does not hint after the last attempt before a deadline.
-
-## 7. The assistant's own integrity
+## 6. The assistant's own integrity
 
 **Enforced in code** (`guard.py`): `is_self()` recognizes the assistant's own code and rules, `is_instruction()` its instruction files, `is_persistence()` launch agents, shell profiles, and other places a change outlives the session, and `is_floor_file()` the tables the secret floor is built from. Writing to a floor file is a `deny` (`DENY_FLOOR_WRITE`, in `FLOOR_REASONS`); an edit that would drop a floor entry is caught by `_drops_floor_entry()`. The assistant's shell cannot reach the app's own HTTP API (`RULE_APP_API`, a floor reason), so a script cannot mark something as done behind the user's back. Model-written JavaScript in a browser tab has its own floor (`DENY_PAGE_JS` for scripts that build or send; `page_js_refusal()`).
 
 In the user's own terminal, the assistant may type and press keys but never Enter (`sends_enter()`, `DENY_TERMINAL_ENTER`): that terminal is the one shell on the Mac outside the sandbox, and the keystroke that runs a line stays the user's. Run buttons in Script Editor, Automator, and Shortcuts are the user's for the same reason (`DENY_RUN_BY_HAND`, `DENY_SCRIPT_ENTER`).
 
-## 8. Known limits
+## 7. Known limits
 
 - The guard is heuristics over strings. It classifies commands, scripts, paths, and URLs by parsing and pattern tables, and it explains itself in plain words. It can be wrong in both directions. The OS sandbox is what enforces paths and network for the shell; the guard is the layer that routes the gray zone to the user.
 - The injection detector is a flag, not a filter. The protection against injection is structural: fences, neutering, taint, and the tripwire.
