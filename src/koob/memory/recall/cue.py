@@ -39,6 +39,12 @@ class Cue(BaseModel):
     asks_source: bool = False  # «кто сказал», "who told me": the answer is who said it
     ruled_out: list[str] = Field(default_factory=list)  # namesakes the question does not mean
     namesakes: dict[str, str] = Field(default_factory=dict)  # same-name people still asked
+    # a question that asks to recall what someone said, did or planned, when something
+    # happened, or several things: the basket may hold more lines (see `asks_recall`)
+    recall: bool = False
+    # «сейчас», «теперь», "now", "currently", "latest": the answer is the newest state, so a
+    # person's items keep their newest-first order rather than one by likeness to the words
+    current: bool = False
 
 
 # ---------------------------------------------------------------- dates
@@ -441,6 +447,11 @@ _PAST_LEX = policy._lex(
     "=был|=была|=было|=были|=жил|=жила|=жили|снимал|раньше|прежн|прошл|до переезда",
     "=was|=were|=lived|used to|=before|previous|former",
 )
+_CURRENT_LEX = policy._lex(
+    "=сейчас|=теперь|=нынче|текущ|последн|до сих пор|всё ещё|все еще|на данный момент",
+    "=now|=current|=currently|=latest|=still|=nowadays|=anymore|=recent|=recently|these days"
+    "|at the moment|right now|most recent",
+)
 # «кто сказал», «от кого узнал», "who told me", "according to": the question asks who said a
 # thing, so its lines keep the words that name the sender or the relative behind the claim
 _SOURCE_LEX = policy._lex(
@@ -472,6 +483,73 @@ def relations_of(ws: list[str]) -> list[str]:
         if policy._hits(ws, lex):
             out.extend(r for r in rels if r not in out)
     return out
+
+
+# ---------------------------------------------------------------- recall questions
+
+# A question opens with a question word (or ends with «?»), or asks to be reminded or told.
+_QUESTION_WORDS = policy._lex(
+    "=что|=чего|=чем|=когда|=где|=куда|=откуда|=кто|=кого|=кому|=кем|=почему|=зачем|=как|=какой"
+    "|=какая|=какое|=какие|=каких|=каким|=сколько|=чей|=чья|=чье|=чьи|=ли",
+    "=what|=when|=where|=who|=whom|=whose|=why|=how|=which|=did|=does|=do|=is|=are|=was|=were"
+    "|=has|=have|=had",
+)
+_REQUEST = policy._lex(
+    "напомни|расскажи|перечисли|вспомни|=помнишь",
+    "=remind|=recall|tell me|=list|do you remember",
+)
+# What someone said, asked, promised, decided, planned or did: an event or a saying to recall.
+_SAID = policy._lex(
+    "сказал|говорил|рассказ|упомина|упомян|обсужд|обсуди|обещал|советов|посовет|писал|написал"
+    "|предлагал|предложил|спрашивал|планир|собирал|делал|сделал|случил|произош|решил|решали",
+    "=назад|=said|=say|=says|=told|=tell|=tells|mention|=talked|talk about|discuss|promis|advice"
+    "|advis|describ|suggest|=asked|=plan|=plans|=planned|=planning|=happened|=happen|=ago"
+    "|=decided|=decide|=did|=ever",
+)
+# Several things at once: «какие», «оба», "which", "what kinds", "both".
+_SEVERAL = policy._lex(
+    "=какие|=каких|=какими|=оба|=обе|=обоих|перечисл|что еще|чем еще|=всех",
+    "what kind|what kinds|what sort|what are|what were|=both|=list|what else|=ways",
+)
+# The past tense by its form, in either language («ездила», «открыли»; "visited", "opened").
+_PAST_FORM_RU = re.compile(r"^[а-я]{2,}[аеиоуыя]л(?:а|о|и)?(?:сь|ся)?$")
+_PAST_FORM_EN = re.compile(r"^[a-z]{3,}[^e]ed$")
+# nouns of the same shape («как дела», «школа») and English words ending in -eed
+_NOT_PAST = frozenset(
+    ("дела", "тела", "мила", "сила", "пила", "вилла", "школа", "стола", "пола", "зала")
+    + ("угла", "числа", "могила", "need", "speed", "indeed", "seed", "feed", "breed")
+)
+
+
+def _past_form(ws: list[str]) -> bool:
+    return any(
+        w not in _NOT_PAST and (_PAST_FORM_RU.match(w) or _PAST_FORM_EN.match(w)) for w in ws
+    )
+
+
+def asks_recall(
+    text: str,
+    ws: list[str],
+    *,
+    relations: list[str],
+    past: bool,
+    hint: bool,
+    asks_source: bool,
+) -> bool:
+    """A question that asks to recall: what someone said, did, decided or planned, when
+    something happened, or several things at once. Its answer may sit in any of many dated
+    lines, so the basket may hold more of them. A lookup of one known relation («где жила
+    Лена», "what's her number") keeps the narrow basket: its tense alone does not widen it,
+    only a saying, a decision, an event or a list does. «Когда» alone asks a date that may
+    have moved (a plan, a schedule) and keeps the narrow basket too."""
+    if not ws:
+        return False
+    question = "?" in text or ws[0] in _QUESTION_WORDS[1] or policy._hits(ws, _REQUEST)
+    if not question:
+        return False
+    if hint or asks_source or policy._hits(ws, _SAID) or policy._hits(ws, _SEVERAL):
+        return True
+    return (past or _past_form(ws)) and not relations
 
 
 def value_types_of(ws: list[str]) -> list[str]:
@@ -763,6 +841,9 @@ def parse(turn: TurnCtx, *, now: str, conn: sqlite3.Connection | None = None) ->
         scope["task"] = "1"
     hint = bool(text and _EPISODE_HINT.search(text.casefold()))
     constraints = episode_constraints(text, ids, dates) if text else {}
+    value_types = value_types_of(ws)
+    asks_source = bool(text) and policy._hits(ws, _SOURCE_LEX)
+    recall = asks_recall(text, ws, relations=rels, past=past, hint=hint, asks_source=asks_source)
     return Cue(
         entity_ids=ids,
         dates=dates,
@@ -774,10 +855,12 @@ def parse(turn: TurnCtx, *, now: str, conn: sqlite3.Connection | None = None) ->
         words=text,
         name_scores=names,
         relations=rels,
-        value_types=value_types_of(ws),
+        value_types=value_types,
         self_ref=policy._hits(ws, _SELF_LEX),
         past=past,
-        asks_source=bool(text) and policy._hits(ws, _SOURCE_LEX),
+        asks_source=asks_source,
         ruled_out=ruled_out,
         namesakes=namesakes,
+        recall=recall,
+        current=policy._hits(ws, _CURRENT_LEX),
     )

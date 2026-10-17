@@ -60,7 +60,7 @@ from ..model import (
     TurnCtx,
     TurnOrigin,
 )
-from ..recall import safe_text
+from ..recall import lexical, safe_text
 
 FREEZE_S = 60.0
 SAFETY_JOB = "safety_net"
@@ -806,6 +806,76 @@ def _mask_written_raws(conn: sqlite3.Connection, record_id: str, turn: TurnCtx, 
         )
 
 
+FIX_MARK = "fix:"  # `raw_retractions.record_id` prefix of a correction no record carried yet
+
+
+def mark_corrected_raws(conn: sqlite3.Connection, turn: TurnCtx, words: str) -> int:
+    """A correction leaves its mark on the user's own earlier messages holding the value it
+    retires, whether or not a record holds that value yet (the message may still wait for a
+    worker): a `raw_retractions` row keyed `fix:<turn id>` per message and retired value. The
+    raw lanes cut it (`basket._raw_past`); a later extraction reads the correction itself
+    (`ledger.retired_sides` orders it), so `ledger.check_retracted` skips these rows. The
+    retired values are the user's contrast («не X, а Y», "Y, not X") and another name put in
+    the same place slot; a message is marked only when it shares a topic stem with the
+    correction besides the value itself. With no contrast the retired value is read by slot
+    (`slot_sides`), and an amount takes the totals computed from it (`derived_amounts`); with
+    one, a new value of the contrasted type stated besides it retires the old value of that
+    slot as well (`restated_sides`)."""
+    from ..recall import basket
+
+    words = (words or "").strip()
+    if not words or not (his_correction(words) or retired_values(words) or _slots(words)):
+        return 0
+    when = turn.clock or _now()
+    own = tuple(t.value for t in ledger.USER_TIERS)
+    rows = conn.execute(
+        "SELECT id, rev, ts, chat_id, text, author_tier FROM raw_chunks WHERE status = 'active'"
+        " AND quarantined = 0 AND junk = 0 AND author_tier IN (?, ?) AND turn_id IS NOT ?"
+        " AND text IS NOT NULL AND ts < ? ORDER BY rowid DESC LIMIT ?",
+        (*own, turn.turn_id, when, basket.RECENT_RAWS),
+    ).fetchall()
+    if not rows:
+        return 0
+    key = f"{FIX_MARK}{turn.turn_id}"
+    said = {"id": key, "rev": 0, "ts": when, "text": words, "author_tier": own[0]}
+    marks: dict[tuple[str, str], None] = {}
+    for raw_id, pairs in basket._later_contrasts(conn, rows, [said]).items():
+        for side, _cid in pairs:
+            marks[(raw_id, side)] = None
+    for side in retired_values(words):
+        for r in rows:
+            if ledger.holds_value(side, r["text"] or ""):
+                marks.setdefault((str(r["id"]), side), None)
+    # only a message on the topic of the user's correction: one shared topic stem besides the value
+    topic = basket._topic(words)
+    texts = {str(r["id"]): r["text"] or "" for r in rows}
+    marks = {
+        (raw_id, side): None
+        for raw_id, side in marks
+        if (basket._topic(texts.get(raw_id, "")) & topic) - basket._topic(side)
+    }
+    if not marks:  # no contrast: the old value is the one of the same slot said earlier
+        for raw_id, side in _slot_marks(rows, words, topic):
+            marks[(raw_id, side)] = None
+    else:  # a contrast that also states a new total or balance retires the old one by slot
+        for raw_id in dict.fromkeys(r for r, _side in marks):
+            done = [side for r, side in marks if r == raw_id]
+            for side in restated_sides(texts.get(raw_id, ""), words, done):
+                marks.setdefault((raw_id, side), None)
+    for raw_id, side in list(marks):  # a total or balance computed from a retired amount
+        for d in derived_amounts(texts.get(raw_id, ""), side):
+            marks.setdefault((raw_id, d), None)
+    for raw_id, side in marks:
+        conn.execute(
+            "INSERT OR IGNORE INTO raw_retractions (raw_id, record_id, retracted_value_norm,"
+            " created_at) VALUES (?, ?, ?, ?)",
+            (raw_id, key, side, when),
+        )
+    if marks and conn.in_transaction:
+        conn.commit()
+    return len(marks)
+
+
 def _status(conn: sqlite3.Connection, rid: str) -> Status | None:
     row = conn.execute("SELECT status FROM records WHERE id = ?", (rid,)).fetchone()
     return Status(row[0]) if row is not None else None
@@ -880,6 +950,256 @@ def seed_fact(conn: sqlite3.Connection, rid: str) -> str | None:
         (rid,),
     ).fetchall()
     return rows[0][0] if len(rows) == 1 else None
+
+
+# ---------------------------------------------------- a correction that names only the new value
+# "Moved to the 21st, same time": no contrast names the old value, so it is read by slot - the
+# value of the same type (day, time, amount, place) in the user's earlier message on the same
+# topic that differs from the new one. A day without a month replaces the day of a full date; a
+# value the correction repeats is never retired.
+
+_SLOT_TIME = re.compile(
+    r"(?<![\w:.])(?P<h>\d{1,2})(?:[:.](?P<m>\d{2}))?\s*(?P<ap>am|pm|a\.m\.|p\.m\.)(?!\w)"
+    r"|(?<![\w:.])(?P<h2>\d{1,2}):(?P<m2>\d{2})(?![\d:])"
+    r"|(?<!\w)(?P<h3>\d{1,2})\s*час\w*"
+    r"|(?<!\w)(?P<word>noon|midnight|полдень|полночь)(?!\w)",
+    re.IGNORECASE,
+)
+_SLOT_DATES = (ledger._ISO, ledger._DAY_MONTH, ledger._MONTH_DAY, ledger._DOTTED)
+_UNIT = (
+    r"(?:k|тыс\w*|млн|млрд|руб\w*|₽|долл\w*|евро|бакс\w*|thousand|million|billion|dollars?"
+    r"|bucks|euros?|pounds?|usd|eur|rub|%)"
+)
+_SLOT_AMOUNT = re.compile(
+    rf"(?P<pre>[$€£₽]\s?)?(?<![\w.,])(?P<n>\d+(?:[.,]\d+)?)(?![\w.,]*\d)(?:\s*(?P<unit>{_UNIT})(?!\w))?",
+    re.IGNORECASE,
+)
+_SLOT_PLACE = re.compile(
+    r"(?<!\w)(?P<prep>in|at|to|from|with|в|во|на|из|с|со|у)\s+"
+    r"(?P<name>[A-ZА-ЯЁ][\w-]+(?:\s+[A-ZА-ЯЁ][\w-]+){0,2})"
+)
+
+
+@dataclass(frozen=True)
+class _Slot:
+    kind: str  # day | time | amount | place
+    surface: str  # as it stands in the text (case folded for the dated kinds)
+    key: tuple[Any, ...]
+    at: int
+
+
+def _blank(text: str, s: int, e: int) -> str:
+    return text[:s] + " " * (e - s) + text[e:]
+
+
+def _slots(text: str) -> list[_Slot]:
+    """The typed values in their words, each with a comparable key."""
+    out: list[_Slot] = []
+    for m in _SLOT_PLACE.finditer(text or ""):
+        out.append(
+            _Slot("place", m["name"], (m["prep"].casefold(), m["name"].casefold()), m.start())
+        )
+    low = (text or "").casefold()
+    for m in list(_SLOT_TIME.finditer(low)):
+        if m["word"]:
+            key: tuple[Any, ...] = ({"noon": 12, "полдень": 12}.get(m["word"], 0), 0)
+        else:
+            h = int(m["h"] or m["h2"] or m["h3"])
+            if (m["ap"] or "").startswith("p") and h < 12:
+                h += 12
+            key = (h, int(m["m"] or m["m2"] or 0))
+        out.append(_Slot("time", m.group().strip(), key, m.start()))
+        low = _blank(low, *m.span())
+    for pat in _SLOT_DATES:
+        for m in list(pat.finditer(low)):
+            toks = ledger.value_tokens(m.group())
+            md = sorted(t for t in toks if t.startswith("date:") and len(t) == 10)
+            if not md:
+                continue
+            mo, dd = (int(x) for x in md[0][5:].split("-"))
+            out.append(_Slot("day", m.group().strip(), (mo, dd), m.start()))
+            low = _blank(low, *m.span())
+    for m in list(ledger._BARE_DAY.finditer(low)):
+        out.append(_Slot("day", m.group(), (None, int(m[1])), m.start()))
+        low = _blank(low, *m.span())
+    for pat, days in ledger._WEEKDAY_WORDS:
+        for m in pat.finditer(low):
+            out.append(_Slot("day", m.group(), ("weekday", days), m.start()))
+    for m in _SLOT_AMOUNT.finditer(low):
+        n = float(m["n"].replace(",", "."))
+        unit = (m["unit"] or m["pre"] or "").strip().casefold()
+        out.append(_Slot("amount", m.group().strip(), (n, unit), m.start()))
+    return sorted(out, key=lambda s: s.at)
+
+
+def _same_slot(old: _Slot, new: _Slot) -> bool:
+    if old.kind == "day":
+        a, b = old.key, new.key
+        if a[0] == "weekday" or b[0] == "weekday":
+            return a == b
+        if a[0] is None or b[0] is None:  # a day without a month: the day part only
+            return a[1] == b[1]
+        return a == b
+    if old.kind == "amount":
+        return old.key[0] == new.key[0]
+    if old.kind == "place":
+        return old.key[1] == new.key[1]
+    return old.key == new.key
+
+
+def slot_sides(old_text: str, words: str) -> list[str]:
+    """The values of `old_text` the correction `words` replaces by slot (see above)."""
+    new, old = _slots(words), _slots(old_text)
+    said = " ".join(words.casefold().split())
+    out: list[str] = []
+    for kind in ("day", "time", "amount", "place"):
+        nv = [s for s in new if s.kind == kind]
+        if not nv:
+            continue
+        ov = [s for s in old if s.kind == kind]
+        if kind == "place":  # a name in the same place slot: the same preposition
+            ov = [o for o in ov if any(o.key[0] == n.key[0] for n in nv)]
+        if any(_same_slot(o, n) for o in ov for n in nv) and len(nv) == len(
+            [o for o in ov if any(_same_slot(o, n) for n in nv)]
+        ):
+            continue  # every value named is the one said before: a repeat, not a change
+        gone = [
+            o
+            for o in ov
+            if not any(_same_slot(o, n) for n in nv) and o.surface.casefold() not in said
+        ]
+        if kind == "amount" and len(gone) > 1:  # the one in the same unit, else the first
+            units = {n.key[1] for n in nv if n.key[1]}
+            same = [o for o in gone if o.key[1] in units]
+            gone = same[:1] if len(same) == 1 else gone[:1]
+        out += [o.surface for o in gone]
+    return list(dict.fromkeys(out))
+
+
+def derived_amounts(text: str, side: str) -> list[str]:
+    """Amounts in `text` computed from the retired amount `side`: a later number that is its
+    sum or difference with another number said before it («lent 500, got 200 back, so 300
+    left»). The old total or balance goes with the old amount."""
+    retired = [s for s in _slots(side) if s.kind == "amount"]
+    if not retired:
+        return []
+    amounts = [s for s in _slots(text) if s.kind == "amount"]
+    out: list[str] = []
+    for a in amounts:
+        if not any(a.key[0] == r.key[0] for r in retired):
+            continue
+        for d in amounts:
+            if d.at <= a.at or d.key[0] == a.key[0]:
+                continue
+            for x in amounts:
+                if x is d or x is a or x.at >= d.at:
+                    continue
+                if d.key[0] in (a.key[0] + x.key[0], a.key[0] - x.key[0], x.key[0] - a.key[0]):
+                    out.append(d.surface)
+    return list(dict.fromkeys(out))
+
+
+_CLAUSE_BREAK = re.compile(
+    r"[,.;:!?()]|(?<!\w)(?:and|so|but|then|which|и|а|но|так что|поэтому|значит)(?!\w)",
+    re.IGNORECASE,
+)
+
+
+def _clause_topic(text: str, at: int, surface: str) -> set[str]:
+    """Topic stems of the clause of `text` around position `at`, the value itself aside."""
+    from ..recall import basket
+
+    start, end = 0, len(text)
+    for m in _CLAUSE_BREAK.finditer(text):
+        if m.end() <= at:
+            start = m.end()
+        elif m.start() > at:
+            end = m.start()
+            break
+    return basket._topic(text[start:end]) - basket._topic(surface)
+
+
+def restated_sides(old_text: str, words: str, retired: Sequence[str]) -> list[str]:
+    """Values of `old_text` a correction carrying a contrast restates by slot: besides the new
+    side of the contrast it states another new value of the contrasted type («450, not 400, so
+    the fund is at 1550» against «paid 400, so the fund is down to 1600»), and that value
+    replaces the old one of its slot even when nothing in their words computes it. The new side
+    is the new value nearest the retired one; each other new value takes the old value of its
+    type whose clause shares a topic stem with its own clause (or, for an amount, one of the
+    same order), the most shared and then the latest first. A value the correction repeats or
+    the contrast retires stays."""
+    low_w, low_o = (words or "").casefold(), (old_text or "").casefold()
+    said = " ".join(low_w.split())
+    new, old = _slots(words), _slots(old_text)
+    out: list[str] = []
+    for side in retired:
+        gone = [g for g in _slots(side) if g.kind != "place"]
+        pos = low_w.find(side.casefold())
+        for kind in dict.fromkeys(g.kind for g in gone):
+            mine = [g for g in gone if g.kind == kind]
+            ov = [o for o in old if o.kind == kind]
+            nv = [
+                n
+                for n in new
+                if n.kind == kind
+                and not any(_same_slot(g, n) for g in mine)
+                and not any(_same_slot(o, n) for o in ov)
+            ]
+            if pos >= 0 and nv:  # the contrast's own new side
+                nv.remove(min(nv, key=lambda n: abs(n.at - pos)))
+            free = [
+                o
+                for o in ov
+                if not any(_same_slot(o, n) for n in new)
+                and not any(_same_slot(o, g) for g in mine)
+                and o.surface.casefold() not in said
+                and o.surface not in out
+            ]
+            for n in nv:
+                near = _clause_topic(low_w, n.at, n.surface)
+
+                def fit(o: _Slot, n: _Slot = n, near: set[str] = near, k: str = kind) -> int:
+                    shared = len(near & _clause_topic(low_o, o.at, o.surface))
+                    if shared:
+                        return shared
+                    a, b = o.key[0], n.key[0]
+                    return int(k == "amount" and a > 0 and b > 0 and 1 / 3 <= a / b <= 3)
+
+                fits = [o for o in reversed(free) if fit(o)]
+                if fits:
+                    best = max(fits, key=fit)
+                    out.append(best.surface)
+                    free.remove(best)
+    return list(dict.fromkeys(out))
+
+
+# words of the change itself, not of its topic: they never pick the message it corrects
+_CHANGE_WORDS = (
+    "moved", "move", "pushed", "push", "rescheduled", "changed", "change", "make", "made",
+    "same", "time", "still", "now", "again", "actually", "update", "instead", "перенесли",
+    "перенеси", "перенёс", "сдвинули", "поменяли", "тоже", "время", "теперь", "сделай",
+)  # fmt: skip
+_CHANGE_STEMS = frozenset(lexical.stem(w) for w in _CHANGE_WORDS)
+
+
+def _slot_marks(rows: Sequence[Any], words: str, topic: set[str]) -> list[tuple[str, str]]:
+    """(raw id, retired value) by slot, in ONE earlier message of the user's: the one sharing most
+    topic stems with the correction (the change words and the values aside), the newest on a
+    tie, among those holding a different value of a type the correction names."""
+    from ..recall import basket
+
+    topic = topic - _CHANGE_STEMS
+    best: tuple[int, str, list[str]] | None = None
+    for r in rows:  # newest first
+        text = r["text"] or ""
+        shared = (basket._topic(text) & topic) - _CHANGE_STEMS
+        if not shared or (best is not None and len(shared) <= best[0]):
+            continue
+        sides = slot_sides(text, words)
+        shared -= basket._topic(" ".join(sides))
+        if sides and shared and (best is None or len(shared) > best[0]):
+            best = (len(shared), str(r["id"]), sides)
+    return [(best[1], side) for side in best[2]] if best else []
 
 
 _HELD_ATTRS = ("value_text", "value_norm", "quote_orig", "text_en", "origin_quote")

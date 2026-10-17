@@ -226,7 +226,7 @@ def test_bench_report_extract_cloud_uses_the_processor_and_labels_the_column(tmp
     made = []
     model = CountingModel()
 
-    def fake_make(mode):
+    def fake_make(mode, **_kw):
         made.append(mode)
         return model
 

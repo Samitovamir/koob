@@ -285,9 +285,10 @@ def search(
     include_archived: bool = False,
     store: Conn | None = None,
 ) -> list[Item]:
-    """MCP `search` (§10.4): ranked items with handles; obeys use-now (§5.5). On a send turn
-    sensitive items stay visible, marked «не отправлять без его слова». Writes `served` rows.
-    Lexical only until fusion and vectors land; `scope` is not used yet."""
+    """MCP `search` (§10.4): ranked items with handles, records and raw messages, found by
+    words and by meaning and fused; every item passes the basket's truth checks and use-now
+    (§5.5). On a send turn sensitive items stay visible, marked «не отправлять без его слова»
+    (do not send without the user's word). Writes `served` rows. `scope` is not used yet."""
     from . import commands
 
     return commands.search(
@@ -376,6 +377,8 @@ def fix(
         assertion=assertion,
         retract=retract,
     )
+    if w.outcome != "ask_first":
+        hot.mark_corrected_raws(_conn(store), turn, correction or because_quote)
     res = WriteResult(**asdict(w))
     _note_write(store, "memory_fix", target, res.outcome, res.line)
     return res

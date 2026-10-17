@@ -8,8 +8,11 @@ Spec: §3.1, §3.2 invariants, §9.1a, §10.2, §10.3, §18 (G12).
   labels, own, dim, vec, raw)` (fp16, L2-normalised) and `vmeta` (`schema`, `serving`). It is
   never backed up and may be deleted at any time: the next `embed` job rebuilds it.
 - **Raw messages.** Usable raw chunks (active, not quarantined, not junk) are embedded too,
-  in their own language, as rows with `raw = 1` keyed by the chunk id and versioned by its
-  `rev` (a redaction bumps it: the redacted text is re-embedded, the old vector goes).
+  in their own language, as rows with `raw = 1` keyed by the chunk id. The embedded text is
+  `<date> <sender>: <text>` (`raw_doc`), so a question naming a person or a day meets that
+  person's messages. A row's version is `raw_version(rev)`: the chunk's `rev` (a redaction
+  bumps it: the redacted text is re-embedded, the old vector goes) under `RAW_RECIPE`, which
+  is bumped when the embedded form changes, so every raw row re-embeds once.
   `search_split` scores both kinds in one scan: the records' meaning lane and the raw one.
 - **Pull model.** `embed_pending` embeds usable records (active/archived) that have no vector
   for the current embedder (or one of an older record version). It runs as the background job
@@ -23,13 +26,13 @@ Spec: §3.1, §3.2 invariants, §9.1a, §10.2, §10.3, §18 (G12).
   `/private/var` on macOS), so an unresolved name would never match the file a job wrote and
   RAM would keep the first load forever. Every `embed_pending` re-reads RAM when it wrote the
   attached file; a background load never replaces a newer index (a generation count).
-  `embed_query` never loads a model on the turn: the first call starts a local-only
-  background load and returns []. Without fastembed both return [] and log once; nothing
-  here raises into recall.
+  `embed_query` never loads a model on the turn: the first call starts a local-only background
+  load and returns []. Without fastembed both return [] and log once; nothing here raises
+  into recall.
 - **Forget (§9.1a, §9.1d).** forget.py deletes rows of forgotten record ids; `stop_hook`
   drops the event's record and raw ids from RAM and deletes their rows from the attached
   file; `sweep_orphans` (startup and purge) deletes rows and RAM entries of records and raws
-  that are not usable (and raw rows of an older `rev`), which heals a crash between the
+  that are not usable (and raw rows of an older `raw_version`), which heals a crash between the
   ledger commit and the vector delete.
 - **Labels.** Rows carry the record's labels and own-ness, refreshed by every `embed_pending`;
   the mask here is the finders' fence (a superset), use-now (`policy.decide`) still decides.
@@ -63,8 +66,12 @@ CHUNK_ROWS = 16_384  # rows converted fp16 -> fp32 per step; ~1.3 ms each at 768
 BATCH = 32  # documents per embedding call and per vectors.db transaction
 _USABLE_SQL = "('active', 'archived')"
 _OWN_TIERS = ("user", "user_confirmed")  # policy._OWN_SQL: user's own items pass the label fence
+_NAMED_TIERS = ("other", "user_room")  # raws whose sender is a person other than the user
 _SQL_CHUNK = 400
 RAW_CHARS = 1_000  # a raw message is embedded from its first characters (chunks are short)
+RAW_RECIPE = 2  # the raw embedding form: 1 = text alone, 2 = date, sender and text
+_RAW_REV_SPAN = 1 << 32  # a raw row's version = RAW_RECIPE * span + the chunk's rev
+OWN_SPEAKER = "me"  # the sender of the user's own messages in the embedded form
 _RAW_USABLE_SQL = "status = 'active' AND quarantined = 0 AND junk = 0 AND text IS NOT NULL"
 
 # The text each record kind is embedded from (records are stored in English, §10.3).
@@ -79,12 +86,43 @@ _TEXT_SQL = (
     " LEFT JOIN episodes e ON e.id = r.id"
     f" WHERE r.status IN {_USABLE_SQL}"
 )
-# Raw messages are embedded from their own text, in the language they were written in.
+# Raw messages are embedded from their own text, in the language they were written in, after
+# their date and sender (`raw_doc`).
 _RAW_TEXT_SQL = (
-    "SELECT c.id, c.rev, c.labels, c.author_tier, substr(c.text, 1, ?) AS text"
-    " FROM raw_chunks c WHERE c.status = 'active' AND c.quarantined = 0 AND c.junk = 0"
-    " AND c.text IS NOT NULL"
+    "SELECT c.id, c.rev, c.labels, c.author_tier, c.ts, e.display_name,"
+    " substr(c.text, 1, ?) AS text"
+    " FROM raw_chunks c LEFT JOIN entities e ON e.id = c.author_entity_id"
+    " WHERE c.status = 'active' AND c.quarantined = 0 AND c.junk = 0 AND c.text IS NOT NULL"
 )
+
+
+def raw_version(rev: int) -> int:
+    """The version a raw chunk's vector row carries: its `rev` under the current recipe."""
+    return RAW_RECIPE * _RAW_REV_SPAN + int(rev)
+
+
+def raw_speaker(tier: str | None, display_name: str | None) -> str:
+    """Who sent a raw message, as its embedded form names them: the user's own messages are
+    `OWN_SPEAKER`, another person's carry their display name; tools and the system none."""
+    if tier in _OWN_TIERS:
+        return OWN_SPEAKER
+    return " ".join((display_name or "").split()) if tier in _NAMED_TIERS else ""
+
+
+def raw_doc(ts: str | None, speaker: str, text: str) -> str:
+    """The embedded form of a raw message: `<date> <sender>: <text>`, compact and in no
+    language of its own (the date is ISO, the sender a name)."""
+    head = " ".join(x for x in ((ts or "")[:10], speaker) if x)
+    return f"{head}: {text}" if head else text
+
+
+def _raw_docs(
+    rows: Iterable[tuple[str, int, int, str, str | None, str | None, str | None]],
+) -> Iterable[tuple[str, int, int, str, str]]:
+    for rid, rev, labels, tier, ts, name, text in rows:
+        if (text or "").strip():
+            yield rid, raw_version(rev), labels, tier, raw_doc(ts, raw_speaker(tier, name), text)
+
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS vmeta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -396,7 +434,7 @@ def _usable(memory: sqlite3.Connection, ids: Iterable[str]) -> set[str]:
 
 
 def _usable_versions(memory: sqlite3.Connection, ids: Iterable[str]) -> dict[str, int | None]:
-    """Usable ids -> the raw chunk's current `rev` (None for a record, whose version
+    """Usable ids -> the raw chunk's current `raw_version` (None for a record, whose version
     `embed_pending` checks)."""
     ids = list(ids)
     out: dict[str, int | None] = {}
@@ -410,7 +448,7 @@ def _usable_versions(memory: sqlite3.Connection, ids: Iterable[str]) -> dict[str
         for r in memory.execute(
             f"SELECT id, rev FROM raw_chunks WHERE id IN ({qs}) AND {_RAW_USABLE_SQL}", chunk
         ):
-            out[r[0]] = int(r[1])
+            out[r[0]] = raw_version(r[1])
     return out
 
 
@@ -470,7 +508,7 @@ def embed_pending(
     relabel: list[tuple[int, int, str]] = []
     sources = (
         (memory.execute(_TEXT_SQL), 0),
-        (memory.execute(_RAW_TEXT_SQL, (RAW_CHARS,)), 1),
+        (_raw_docs(memory.execute(_RAW_TEXT_SQL, (RAW_CHARS,))), 1),
     )
     for rows, is_raw in sources:
         for rid, ver, labels, tier, text in rows:
@@ -820,6 +858,26 @@ def search_split(
     except Exception as exc:
         _log_once("search", "memory vectors: search failed (%s)", type(exc).__name__)
         return [], []
+
+
+def cosines(query_vec: list[float], ids: Iterable[str]) -> dict[str, float]:
+    """The cosine of each of `ids` that has a live vector in the serving index to
+    `query_vec` (ids without one are left out). Only the named rows are scored, so it costs
+    a few microseconds per id. Never raises, never blocks."""
+    try:
+        idx = _index[0]
+        if idx is None or not query_vec or len(query_vec) != idx.dim:
+            return {}
+        pos = [(i, p) for i in dict.fromkeys(ids) if (p := idx.pos.get(i)) is not None]
+        pos = [(i, p) for i, p in pos if p < len(idx.alive) and idx.alive[p]]
+        if not pos:
+            return {}
+        q = _unit(np.asarray(query_vec, np.float32))
+        sc = idx.mat[[p for _, p in pos]].astype(np.float32) @ q
+        return {i: float(s) for (i, _), s in zip(pos, sc, strict=True)}
+    except Exception as exc:  # noqa: BLE001 - a scoring failure only loses the reorder
+        _log_once("cosines", "memory vectors: cosines failed (%s)", type(exc).__name__)
+        return {}
 
 
 def _best(idx: _Index, scores: np.ndarray, ok: np.ndarray, limit: int) -> list[tuple[str, float]]:

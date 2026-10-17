@@ -20,7 +20,7 @@ from .conftest import owner
         ("Новый код от домофона 5521, квартира 12", Label.LOCATION_PRECISE),
         ("Дима сказал по секрету, что уходит", Label.THIRD_PARTY_PRIVATE),
         ("адвокат по иску позвонит в пятницу", Label.LEGAL),
-        ("в субботу везу сына на плавание", Label.MINOR),
+        ("в субботу везу сына в школу на олимпиаду", Label.MINOR),
         ("my doctor said the allergy is mild", Label.HEALTH),
     ],
 )

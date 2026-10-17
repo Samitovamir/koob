@@ -84,6 +84,14 @@ def eval_cmd(
     labeler: Annotated[
         str, typer.Option("--labeler", help="auto | on | off — метки безопасности (ждёт прогрева).")
     ] = "auto",
+    extract_model: Annotated[
+        str | None,
+        typer.Option(
+            "--extract-model",
+            help="модель облачного разбора для этого прогона (по умолчанию из настроек); "
+            "кэш хранится отдельно по модели.",
+        ),
+    ] = None,
 ) -> None:
     """Run the memory scenarios and print a table by group."""
     from .judge import NoJudge, OllamaJudge
@@ -137,9 +145,11 @@ def eval_cmd(
         lab: bool | str = {"auto": "auto", "on": True, "off": False}[labeler]
         report = run_set(
             loaded, groups=group, scenario_ids=scenario, only_canary=canary, brain=brain_obj, judge=judge_obj,
-            scale=scale, seed=seed, sut_factory=lambda: ApiSUT(extract=extract, labeler=lab),
+            scale=scale, seed=seed, sut_factory=lambda: ApiSUT(extract=extract, labeler=lab, extract_model=extract_model),
         )  # fmt: skip
         report.meta["extract"] = extract
+        if extract_model:
+            report.meta["extract_model"] = extract_model
     finally:
         judge_obj.close()
     typer.echo(report.table(verbose=verbose and not hidden))

@@ -442,8 +442,10 @@ class ApiSUT:
         extract: str = "off",
         processor: Any | None = None,
         labeler: Any = "auto",
+        extract_model: str | None = None,
     ) -> None:
-        """`extract`: off | cloud | local - which extract processor the worker ticks run
+        """`extract_model`: the cloud extraction model for this run (default: the configured one).
+        `extract`: off | cloud | local - which extract processor the worker ticks run
         (cached on disk, see extract_cache). `processor` overrides it (tests: a fake).
         `labeler`: "auto" (on, except under pytest) | True | False | a classifier object; the
         real one is installed and waited warm in `start` (eval is not a turn path)."""
@@ -454,6 +456,7 @@ class ApiSUT:
         self.api = Guarded(api, after=settle)
         self._stores = stores
         self.extract = extract
+        self.extract_model = extract_model
         self._processor = processor
         self._proc: Any = processor
         self._labeler = labeler
@@ -537,7 +540,7 @@ class ApiSUT:
         if proc is None and self.extract != "off":
             from .extract_cache import make_processor
 
-            proc = make_processor(self.extract)
+            proc = make_processor(self.extract, model=self.extract_model)
         self._proc = proc
         if proc is not None:
             ex.configure(**{getattr(proc, "route", self.extract): proc})

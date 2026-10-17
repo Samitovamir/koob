@@ -281,6 +281,12 @@ def suppression_hmac(subject_id: str, family: str, value_norm: str) -> str:
     return keyed_hmac("sup", subject_id, family, value_norm or "")
 
 
+def value_hmac(value_norm: str) -> str:
+    """A forgotten fact's distinctive value alone (`_distinct_value`): what every read checks
+    so no other fact, nickname or name holding that value serves it again."""
+    return keyed_hmac("supv", value_norm)
+
+
 def stable_id_hmac(kind: str, value: str) -> str:
     """§9.8: a forgotten entity's stable id."""
     return keyed_hmac("stable", kind, match_norm(value).strip())
@@ -817,6 +823,172 @@ def _same_words(conn: sqlite3.Connection, recs: set[str]) -> set[str]:
     return out
 
 
+def _distinct_value(value: str | None) -> str | None:
+    """A fact value specific enough to recognise in another record's text: it holds a digit,
+    several words, or one word of five letters or more (a code, a date, a place name)."""
+    norm = " ".join(match_norm(value or "").split())
+    if not norm:
+        return None
+    if any(ch.isdigit() for ch in norm) or " " in norm or len(norm) >= 5:
+        return norm
+    return None
+
+
+def _same_value(conn: sqlite3.Connection, recs: set[str]) -> set[str]:
+    """The records of another kind learned from the same message as a forgotten fact whose
+    own text holds that fact's value (the intention «change the locker code 4417 after the
+    trip» next to the fact «the locker code is 4417»), even when the extractor quoted another
+    span of the message for them: one value told once is forgotten in every kind holding it.
+    A record about other people only, or one that does not hold the value, stays."""
+    out: set[str] = set()
+    family = {"preference": "fact"}
+    for rid in sorted(recs):
+        kind = _record_kind(conn, rid)
+        if family.get(kind, kind) != "fact":
+            continue
+        row = conn.execute("SELECT value_text FROM facts WHERE id = ?", (rid,)).fetchone()
+        value = _distinct_value(row[0] if row else None)
+        if value is None:
+            continue
+        held = re.compile(r"(?<!\w)" + re.escape(value) + r"(?!\w)")
+        mine = _anchors(conn, rid)
+        for raw_id in sorted(_lineage_raw(conn, rid)):
+            for other in sorted(_usable(conn, _raw_users(conn, raw_id)) - recs - out):
+                o_kind = _record_kind(conn, other)
+                if o_kind == "entity" or family.get(o_kind, o_kind) == "fact":
+                    continue  # a copy of the fact goes by `_fact_closure`
+                theirs = _anchors(conn, other)
+                if mine and theirs and not mine & theirs:
+                    continue
+                text = conn.execute(
+                    "SELECT f.text, r.origin_quote FROM records r LEFT JOIN fts_records f"
+                    " ON f.rowid = r.fts_rowid WHERE r.id = ?",
+                    (other,),
+                ).fetchone()
+                words = " ".join(match_norm(str(x)) for x in text or () if x)
+                if held.search(" ".join(words.split())):
+                    out.add(other)
+    return out
+
+
+def _value_siblings(conn: sqlite3.Connection, recs: set[str]) -> set[str]:
+    """The other usable facts about the same person (or learned from the same message) whose
+    value or words hold a forgotten fact's distinctive value under another relation («streams
+    as Ghostfox-88» next to «her gamer tag is Ghostfox-88»): the value is forgotten, not one
+    phrasing of it. Facts about other people stay unless their message is the same."""
+    out: set[str] = set()
+    for rid in sorted(recs):
+        row = conn.execute(
+            "SELECT subject_id, value_entity_id, value_text FROM facts WHERE id = ?", (rid,)
+        ).fetchone()
+        value = _distinct_value(row[2]) if row else None
+        if value is None:
+            continue
+        held = re.compile(r"(?<!\w)" + re.escape(value) + r"(?!\w)")
+        who = [x for x in (row[0], row[1]) if x]
+        cand = _ids_in(conn, "SELECT id FROM facts WHERE subject_id IN ({qs})", who)
+        cand |= _ids_in(conn, "SELECT id FROM facts WHERE value_entity_id IN ({qs})", who)
+        for raw_id in _lineage_raw(conn, rid):
+            cand |= _raw_users(conn, raw_id)
+        for other in sorted(_usable(conn, cand - recs - out)):
+            if _record_kind(conn, other) not in ("fact", "preference"):
+                continue
+            text = conn.execute(
+                "SELECT value_text, value_norm, text_en, quote_orig FROM facts WHERE id = ?",
+                (other,),
+            ).fetchone()
+            words = " ".join(match_norm(str(x)) for x in text or () if x)
+            if held.search(" ".join(words.split())):
+                out.add(other)
+    return out
+
+
+def _about_whom(conn: sqlite3.Connection, rid: str) -> set[str]:
+    row = conn.execute(
+        "SELECT subject_id, value_entity_id FROM facts WHERE id = ?", (rid,)
+    ).fetchone()
+    return {x for x in (row or ()) if x and x != OWNER_ENTITY_ID}
+
+
+_SENTENCE_END = re.compile(r"[.!?…]+(?:\s+|$)|\n+")
+
+
+def _sentences_of(text: str, quote: str | None) -> set[int]:
+    """Which sentences of `text` the quote stands in (none when it cannot be located)."""
+    at = _locate(text, quote)
+    if at is None:
+        return set()
+    cuts = [m.end() for m in _SENTENCE_END.finditer(text)]
+    first = sum(1 for c in cuts if c <= at[0])
+    last = sum(1 for c in cuts if c < at[1])
+    return set(range(first, last + 1))
+
+
+def _same_message_kin(conn: sqlite3.Connection, recs: set[str]) -> set[str]:
+    """For a forget for good: the other usable facts learned from the same sentence of the
+    same message as a forgotten fact and about the same person or thing (its subject or value
+    entity, never the user). There they tell the same thing under other relations («borrowed
+    from me», «has not paid it back» next to «owes me 40 thousand since spring»); another
+    sentence about the same person («he also got a puppy») is another memory."""
+    out: set[str] = set()
+    for rid in sorted(recs):
+        who = _about_whom(conn, rid)
+        if not who:
+            continue
+        for raw_id in _lineage_raw(conn, rid):
+            row = conn.execute("SELECT text FROM raw_chunks WHERE id = ?", (raw_id,)).fetchone()
+            text = str(row[0] or "") if row else ""
+            one = len([m for m in _SENTENCE_END.finditer(text.strip())]) <= 1
+            mine = set() if one else _sentences_of(text, _quote_of(conn, rid))
+            if not one and not mine:
+                continue
+            for other in sorted(_usable(conn, _raw_users(conn, raw_id) - recs - out)):
+                if _record_kind(conn, other) not in ("fact", "preference"):
+                    continue
+                if not _about_whom(conn, other) & who:
+                    continue
+                if one or mine & _sentences_of(text, _quote_of(conn, other)):
+                    out.add(other)
+    return out
+
+
+def emptied_hmac(entity_id: str) -> str:
+    """The suppression a forget for good leaves for a person it emptied: the name stays a
+    record (the user can name them anew), but no read path shows it until something new is
+    known."""
+    return keyed_hmac("emptied", entity_id)
+
+
+def _facts_about(conn: sqlite3.Connection, eid: str) -> set[str]:
+    return {
+        r[0]
+        for r in conn.execute(
+            "SELECT id FROM facts WHERE subject_id = ? UNION SELECT id FROM facts"
+            " WHERE value_entity_id = ?",
+            (eid, eid),
+        )
+    }
+
+
+def _emptied_entities(conn: sqlite3.Connection, recs: set[str]) -> set[str]:
+    """The people and things (never the user) the forgotten facts were about of whom no
+    usable fact is left once they go: their name alone would still tell what was forgotten
+    («Max's brother» of a forgotten debt)."""
+    ents = {e for rid in sorted(recs) for e in _about_whom(conn, rid)} - recs
+    return {e for e in ents if not _usable(conn, _facts_about(conn, e) - recs)}
+
+
+def _told_anew(conn: sqlite3.Connection, eid: str) -> bool:
+    """Something usable is known about this emptied person again: the user's new word about them."""
+    for rid in sorted(_usable(conn, _facts_about(conn, eid))):
+        if rid in hidden_by_forget(conn, [rid]):
+            continue
+        row = conn.execute("SELECT recorded_at FROM records WHERE id = ?", (rid,)).fetchone()
+        if row is not None and not _order_at(conn, str(row[0] or "")):
+            return True
+    return False
+
+
 def _names_entity(conn: sqlite3.Connection, eid: str) -> set[str]:
     """Records that name an entity: as subject, speaker or value, an impression about it, or
     an episode linked to it."""
@@ -1069,10 +1241,13 @@ def _plan(
     extra_records: Iterable[str] = (),
     extra_raws: Iterable[str] = (),
     extra_masked: Iterable[str] = (),
+    forever: bool = False,
 ) -> _Plan:
     """The stop-use plan. The `extra_*` ids come from a replayed journal line (§9.3 F1):
     records it forgot whole, raw it forgot or redacted (decided again here: redacted when
-    other usable records still read it) and records it masked (re-masked against X)."""
+    other usable records still read it) and records it masked (re-masked against X).
+    `forever`: the same message's other facts about the same person go too, and a person
+    nothing else is known about is hidden (`_emptied_entities`)."""
     plan = _Plan(forget_id=forget_id, scope=scope, targets=list(targets))
     recs, raws, xs, claimed = _resolve_targets(conn, targets, scope)
     plan.claimed = sorted(claimed)
@@ -1083,6 +1258,10 @@ def _plan(
     if scope is not ForgetScope.CHAT:  # the same words in another kind are the same memory
         recs |= _same_words(conn, recs)
     direct = set(recs)  # raw follows these; records built from them follow by cascade
+    if scope is not ForgetScope.CHAT:  # the value in another kind: the record, not its raw
+        recs |= _same_value(conn, direct) | _value_siblings(conn, direct)
+        if forever:
+            recs |= _same_message_kin(conn, direct)
     recs = _cascade_derived_records(conn, recs)
     terms, stable = _x_terms(conn, xs)
     plan.xs = sorted(xs)
@@ -1218,10 +1397,14 @@ def _plan(
             continue
         subject, fam, val = prop
         sups.add(suppression_hmac(subject, fam, val))
+        if kind in ("fact", "preference") and (dv := _distinct_value(val)) is not None:
+            sups.add(value_hmac(dv))
         for a in alias_norms:
             sups.add(alias_hmac(a, fam if fam else kind, val))
     for kind, value in stable:
         sups.add(stable_id_hmac(kind, value))
+    if forever and scope is not ForgetScope.CHAT:
+        sups |= {emptied_hmac(e) for e in _emptied_entities(conn, set(plan.records))}
     claimed_sups: set[str] = set()
     for t in _held_trash(conn, plan.claimed, forget_id):
         prop = _trash_proposition(conn, t)
@@ -1823,6 +2006,7 @@ def _stop_use(
         plan = _plan(
             ctx.conn, targets, scope, fid,
             extra_records=extras[0], extra_raws=extras[1], extra_masked=extras[2],
+            forever=forever,
         )  # fmt: skip
         if not (
             plan.records
@@ -3343,7 +3527,11 @@ def raw_is_forgotten(conn: sqlite3.Connection, raw_id: str) -> bool:
         except (TypeError, ValueError):
             continue
         fid = body.get("forget_id")
-        if not fid or body.get("stage") not in ("stopped", "purging") or body.get("scope") == "chat":
+        if (
+            not fid
+            or body.get("stage") not in ("stopped", "purging")
+            or body.get("scope") == "chat"
+        ):
             continue
         if tier in _USER_TIERS and ts and created and ts > created:
             continue  # the user's new word after the forget (§9.6)
@@ -3364,3 +3552,152 @@ def raw_is_forgotten(conn: sqlite3.Connection, raw_id: str) -> bool:
         if text_matches(text, compile_keys(keys)):
             return True
     return False
+
+
+# ---------------------------------------------------------------- a forget always wins
+
+_JOURNAL_CACHE: dict[str, tuple[tuple[int, int], frozenset[str]]] = {}
+
+
+def journal_forgotten_ids(conn: sqlite3.Connection) -> frozenset[str]:
+    """Read-only: the record ids the forget journal holds forgotten - every forget whose
+    newest line is not a whole «Вернуть», minus what a partial «Вернуть» brought back. The
+    journal outlives the database (it is beside it and in every backup set), so a row a
+    restore, a replayed write or a sweep brought back is still known as forgotten here.
+    Cached per journal file by its size and mtime."""
+    path = journal_path(conn)
+    if path is None or not path.exists():
+        return frozenset()
+    try:
+        st = path.stat()
+    except OSError:
+        return frozenset()
+    key = (st.st_size, st.st_mtime_ns)
+    hit = _JOURNAL_CACHE.get(str(path))
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    out: set[str] = set()
+    for group in _groups(read_journal(path)).values():
+        if group[-1].stage is ForgetStage.UNDONE and group[-1].until is None:
+            continue
+        back = _came_back(group)
+        recs = {r for x in group if x.stage is not ForgetStage.UNDONE for r in x.record_ids}
+        out |= recs - (back[0] if back else set())
+    ids = frozenset(out)
+    _JOURNAL_CACHE[str(path)] = (key, ids)
+    return ids
+
+
+def hidden_by_forget(conn: sqlite3.Connection, ids: Iterable[str]) -> set[str]:
+    """Read-only, for every read path (the basket's hydrate, the core view's fence): which of
+    these record ids a forget holds - named by a live forget in the journal, or a fact whose
+    proposition a forget suppressed (`suppression_hmac(subject, family, value_norm)`) and
+    that is not the user's new word after it (user tier, recorded after the forget, not
+    itself an order to forget). The suppression half needs the HMAC key; the journal half
+    does not."""
+    ids = [str(i) for i in ids]
+    if not ids:
+        return set()
+    out = set(ids) & journal_forgotten_ids(conn)
+    if conn.execute("SELECT 1 FROM suppressions LIMIT 1").fetchone() is None or not has_key():
+        return out
+    for i in range(0, len(ids), 400):
+        chunk = ids[i : i + 400]
+        for (eid,) in conn.execute(
+            f"SELECT id FROM records WHERE kind = 'entity' AND id IN ({_qs(chunk)})",  # noqa: S608
+            chunk,
+        ).fetchall():
+            hit = conn.execute(
+                "SELECT 1 FROM suppressions WHERE hmac = ?", (emptied_hmac(str(eid)),)
+            ).fetchone()
+            if hit is not None and not _told_anew(conn, str(eid)):
+                out.add(str(eid))
+        rows = conn.execute(
+            "SELECT f.id, f.subject_id, f.relation, f.value_norm, f.value_text,"
+            " f.value_entity_id, r.author_tier, r.recorded_at FROM facts f"
+            f" JOIN records r ON r.id = f.id WHERE f.id IN ({_qs(chunk)})",  # noqa: S608
+            chunk,
+        ).fetchall()
+        for row in rows:
+            r = dict(zip(("id", "subject_id", "relation", "value_norm", "value_text",
+                          "value_entity_id", "author_tier", "recorded_at"), row, strict=True))  # fmt: skip
+            if not r["subject_id"] or not _value_norm(r):
+                continue
+            h = suppression_hmac(str(r["subject_id"]), _family(conn, r["relation"]), _value_norm(r))
+            sup = conn.execute(
+                "SELECT created_at FROM suppressions WHERE hmac = ?", (h,)
+            ).fetchone()
+            if sup is None and (dv := _distinct_value(_value_norm(r))) is not None:
+                sup = conn.execute(
+                    "SELECT created_at FROM suppressions WHERE hmac = ?", (value_hmac(dv),)
+                ).fetchone()
+            if sup is None:
+                continue
+            at = str(r["recorded_at"] or "")
+            if r["author_tier"] in _USER_TIERS and at > str(sup[0]) and not _order_at(conn, at):
+                continue  # the user's new word after the forget (§9.6)
+            out.add(str(r["id"]))
+    return out
+
+
+def suppressed_texts(conn: sqlite3.Connection, texts: Iterable[str]) -> set[str]:
+    """Read-only: which of these short texts (a name, a nickname) hold a forgotten fact's
+    distinctive value (`value_hmac`) - whole, or as one of their words. Needs the HMAC key;
+    without suppressions or the key, none."""
+    texts = [t for t in dict.fromkeys(texts) if t]
+    if not texts or not has_key():
+        return set()
+    if conn.execute("SELECT 1 FROM suppressions LIMIT 1").fetchone() is None:
+        return set()
+    out: set[str] = set()
+    for text in texts:
+        norm = " ".join(match_norm(text).split())
+        parts = {norm, *norm.split()}
+        hs = [value_hmac(v) for p in parts if (v := _distinct_value(p)) is not None]
+        if (
+            hs
+            and conn.execute(
+                f"SELECT 1 FROM suppressions WHERE hmac IN ({_qs(hs)}) LIMIT 1",
+                hs,  # noqa: S608
+            ).fetchone()
+        ):
+            out.add(text)
+    return out
+
+
+def reassert_journal(conn: sqlite3.Connection, lines: Iterable[JournalLine]) -> list[str]:
+    """§9.4: a forget always wins over a restore. Run after every restore step that writes
+    (the hot log replay, the sweep): a record the journal holds forgotten that is usable
+    again is forgotten again through the full pipeline, with no trash window when its
+    forget was purged or «насовсем». No journal line is written (the original lines still
+    name these ids, so the next restore does the same). Returns the forget ids applied."""
+    applied: list[str] = []
+    for fid, group in _groups(lines).items():
+        if group[-1].stage is ForgetStage.UNDONE and group[-1].until is None:
+            continue
+        back = _came_back(group)
+        recs = {r for x in group if x.stage is not ForgetStage.UNDONE for r in x.record_ids}
+        recs -= back[0] if back else set()
+        live = _ids_in(
+            conn,
+            "SELECT id FROM records WHERE id IN ({qs}) AND status NOT IN ('forgotten', 'purged')",
+            recs,
+        )
+        if not live:
+            continue
+        job = _job(conn, fid)
+        purged = group[-1].stage is ForgetStage.PURGED or (
+            job is not None and job["payload"].get("stage") in ("purging", "purged")
+        )
+        with contextlib.suppress(ForgetNotFound):
+            _stop_use(
+                conn,
+                sorted(live),
+                scope=ForgetScope.ITEM,
+                forever=purged,
+                conversation=None,
+                forget_id=None if job is not None else fid,
+                journal=False,
+            )  # «насовсем» or purged: the purge job is due now and runs in the worker pool
+            applied.append(fid)
+    return applied

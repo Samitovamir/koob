@@ -39,6 +39,7 @@ _OWN_SQL = "('user', 'user_confirmed')"  # = policy._OWN_SQL (the user's own ite
 # bm25 column weights: text, keywords (bilingual keywords + original quote), aliases
 _WEIGHTS = (1.0, 1.5, 2.0)
 _EXACT_BONUS = 0.5  # a row holding every query stem exactly scores 1.5x its bm25
+_AUTHOR_BONUS = 1.5  # a raw message sent by a person the question names scores 1.5x its bm25
 _MIN_PREFIX_STEM = 5  # stems shorter than this get no prefix pass (too noisy)
 _NAME_FLOOR = 0.5  # trigram Dice similarity a name needs to count
 _FAMILY_SCORE = 0.8  # a diminutive or declined form of the alias («Илюха» ~ «Илья», «Шурик» ~ «Саша»)
@@ -177,10 +178,12 @@ def _top(
     label_mask: int,
     limit: int,
     bonus: Callable[[sqlite3.Row | tuple], float] | None = None,
+    owner_bonus: Callable[[tuple], float] | None = None,
 ) -> list[tuple[str, float]]:
     """FTS first (top-k by bm25, no join: the join over every match is what costs at 10^5),
-    then the label fence on those rows only; k grows ×4 while the fence leaves fewer than
-    `limit` and the index has more. Usable first, then relevance."""
+    then the user fence on those rows only; k grows ×4 while the fence leaves fewer than
+    `limit` and the index has more. Usable first, then relevance. `owner_bonus` scales a
+    row's score by the user row's columns after the first three."""
     k = max(limit * 3, 100)
     while True:
         try:
@@ -195,10 +198,11 @@ def _top(
         for i in range(0, len(rowids), 500):
             chunk = rowids[i : i + 500]
             marks = ", ".join("?" for _ in chunk)
-            for rowid, oid, st in conn.execute(
+            for rowid, oid, st, *extra in conn.execute(
                 owner_sql.format(marks=marks), [*chunk, int(label_mask)]
             ):
-                keep.append((oid, score[rowid], st in _USABLE))
+                sc = score[rowid] * (owner_bonus(tuple(extra)) if owner_bonus else 1.0)
+                keep.append((oid, sc, st in _USABLE))
         if len(keep) >= limit or len(rows) < k:
             keep.sort(key=lambda x: (not x[2], -x[1], x[0]))
             return [(oid, s) for oid, s, _ in keep[:limit]]
@@ -236,10 +240,17 @@ def search_records(
 
 
 def search_raw(
-    conn: sqlite3.Connection, query: str, *, limit: int = 50, label_mask: int = -1
+    conn: sqlite3.Connection,
+    query: str,
+    *,
+    limit: int = 50,
+    label_mask: int = -1,
+    authors: Iterable[str] = (),
 ) -> list[tuple[str, float]]:
     """Raw chunk ids by stemmed BM25 over the contentless `fts_raw`: active chunks only,
-    never quarantined or junk. `label_mask` is the same fence as `search_records`."""
+    never quarantined or junk. `label_mask` is the same fence as `search_records`.
+    `authors`: the entities the question names; their own messages rank higher, since a
+    sender's name is rarely among the words of the messages they wrote."""
     stems = query_stems(query)
     if not stems or limit <= 0:
         return []
@@ -247,10 +258,24 @@ def search_raw(
         "SELECT rowid, bm25(fts_raw) AS s FROM fts_raw WHERE fts_raw MATCH ? ORDER BY s LIMIT ?"
     )
     owner_sql = (
-        "SELECT c.fts_rowid, c.id, c.status FROM raw_chunks c WHERE c.fts_rowid IN ({marks})"
+        "SELECT c.fts_rowid, c.id, c.status, c.author_entity_id FROM raw_chunks c"
+        " WHERE c.fts_rowid IN ({marks})"
         f" AND c.status = 'active' AND c.quarantined = 0 AND c.junk = 0 AND {_fence('c')}"
     )
-    return _top(conn, fts_sql, owner_sql, _match_expr(_match_stems(query)), label_mask, limit)
+    named = frozenset(a for a in authors if a)
+
+    def sent_by_named(extra: tuple) -> float:
+        return _AUTHOR_BONUS if extra and extra[0] in named else 1.0
+
+    return _top(
+        conn,
+        fts_sql,
+        owner_sql,
+        _match_expr(_match_stems(query)),
+        label_mask,
+        limit,
+        owner_bonus=sent_by_named if named else None,
+    )
 
 
 # ---------------------------------------------------------------- names (trigram)

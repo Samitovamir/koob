@@ -104,7 +104,7 @@ def test_cross_language_paraphrase_below_the_old_floor_is_found_when_it_ranks_fi
 ):
     """A Russian question, an English record with no shared word: the meaning lane ranks the
     record first at a cosine under the absolute floor; it is served. With the top-of-lane rule
-    off it is a weak single-lane hit and the basket drops it."""
+    off and the lane's evidence floor above its cosine, it is no evidence and the basket drops it."""
     assert add(conn, entity("e-marta", "Marta Lind")).ok
     assert add(
         conn,
@@ -125,6 +125,7 @@ def test_cross_language_paraphrase_below_the_old_floor_is_found_when_it_ranks_fi
     assert "f-pool" in _ask(conn, question, 1)
     assert "f-marta" not in _ask(conn, question, 2)
     monkeypatch.setattr(basket, "VEC_TOP", 0)
+    monkeypatch.setattr(basket, "VEC_EVIDENCE", 0.5)
     assert "f-pool" not in _ask(conn, question, 3)
 
 

@@ -1,4 +1,4 @@
-"""G1 policy: admit, process routing, use now, chat modes, never-store, label inheritance.
+"""Policy: admit, process routing, use now, chat modes, never-store, label inheritance.
 
 Spec: §2 (pipeline order), §5.1-§5.6.
 Order is normative: admit -> store -> process with an allowed model -> use now -> rank.
@@ -13,8 +13,9 @@ Order is normative: admit -> store -> process with an allowed model -> use now -
   unlabeled too; the cloud needs `labels_final`.
 - **Use now** (§5.5): the user's own items are used wherever they apply, with a one-line note
   («учёл: аллергия на орехи»), never a card or a question gate. The direct-question rule binds
-  only sensitive items from other people, chats and files. On a send turn sensitive items (and
-  other people's precise places) stay visible but held «не отправлять без его слова».
+  only sensitive items from other people, chats and files whose labels name a topic (the
+  uncertain band alone, once final, ranks like an unlabeled item). On a send turn sensitive
+  items (and other people's precise places) stay visible but held «не отправлять без его слова».
 - **Rank** never sees what use-now excluded: the finders apply `mask_clause` in SQL first and
   `decide` stays the second fence.
 
@@ -69,6 +70,15 @@ ALL_LABELS: Label = Label(sum(1 << i for i in range(len(LABEL_NAMES))))
 _LABEL_BITS: tuple[Label, ...] = tuple(Label(1 << i) for i in range(len(LABEL_NAMES)))
 # Labels whose topic is the item's own words: no fixed lexicon can name it (§5.5).
 OPEN_TOPIC: Label = Label.UNKNOWN_SENSITIVE | Label.THIRD_PARTY_PRIVATE
+# §5.5 the user's own items: under these labels, once the classifier has settled them, relevance
+# ranks them. Every named topic (health, money, legal, intimate, identity documents, minors)
+# keeps the applicability test: it goes out only where this turn applies to it.
+OWN_RANKED: Label = OPEN_TOPIC
+# §5.5 a question that names the subject of another person's message and asks that message's
+# own words: at least CONTENT_MIN of the user's content words, and at least CONTENT_SHARE of
+# them, are words of the message (see `_asks_content`).
+CONTENT_MIN = 2
+CONTENT_SHARE = 0.5
 REPLY_WINDOW = timedelta(hours=24)  # §5.6: the peer's first message within 24 h of the send
 PASSWORD_STORE_KINDS = frozenset(
     {"keychain", "password_manager", "1password", "bitwarden", "lastpass"}
@@ -253,6 +263,72 @@ _WEAK: dict[Label, Lexicon] = {
     Label.MINOR: _lex("=школа|=школу|=школе|=школы"),
 }
 _EMPTY: Lexicon = ((), frozenset(), ())
+
+# Arrival precision for `minor` and `health` (the topic lexicons above still read the user's
+# questions whole). `minor` is about a child's personal details: a child word sets it beside a
+# detail about the child (school, health, safety, age, behaviour, a place, or another sensitive
+# label of the same text); a bare mention («took the kids to the park») is a weak hit, and one's
+# own childhood, things made for children or children in general («as a kid», «kids' books»,
+# «a home for kids who need it») are no hit at all.
+_CHILD_NOT = re.compile(
+    r"\b(?:as|when i was|since i was|back when i was) (?:a )?(?:little |young )?(?:kid|child)\b"
+    r"|\bchildhood\b|\bchildless\b|\bchildish\b|\bchild-?free\b"
+    r"|\b(?:kids?|child|children)(?:'s|')? (?:books?|menus?|shows?|movies?|films?|tv|songs?|"
+    r"music|toys?|clothes|section|games?|channel|channels|programs?|programmes?|charity)\b"
+    r"|\bfor (?:the |all the |other |many |more )?(?:kids|children)\b"
+    r"|\b(?:kids|children) (?:who|that) (?:need|needs|deserve)\b|\b(?:kids|children) in need\b"
+    r"|\bкогда (?:я )?(?:был|была) (?:ребенком|маленьк\w*)|\bдля детей\b"
+    r"|\bдетск\w* (?:книг\w*|мульт\w*|игрушк\w*|одежд\w*|магазин\w*|меню|песн\w*|фильм\w*)"
+)
+_CHILD_DETAIL: Lexicon = _lex(
+    "school|kindergarten|preschool|daycare|nursery|teacher|=grade|=grades|homework|recess",
+    "principal|detention|suspend|expell|report card|bully|bulli|=fight|=fights|fought|fighting",
+    "tantrum|misbehav|=trouble|=hurt|=hurts|accident|injur|=lost|missing|kidnap|abus|stranger",
+    "custody|=born|years old|year old|year-old|months old|month-old|=aged|autis|=adhd",
+    "pediatric|paediatric|=fever|=scared|afraid|=bleeding|=broke|=crying|=cries|=allergic",
+    "школ|садик|детсад|=ясли|учител|=классе|оценк|двойк|домашк|контрольн|подрал|драк",
+    "хулига|истерик|обижа|травл|=бьет|избил|пропал|потерял|похит|опек|родился|родилась",
+    "аутизм|=сдвг|логопед|=боится|температур|=плачет|упал|ушиб",
+)
+_CHILD_AGE = re.compile(r"(?i)\b\d{1,2}\s*(?:yo\b|y/o|-?years?\b|-?months?\b|лет\b|год|месяц)")
+# English «health» names a field, a cause or a habit («work in mental health», «a race for
+# mental health») as often as a condition: alone it is a weak hit. Figurative therapy («it's
+# like therapy», «fun and therapeutic») is no hit at all.
+_HEALTH_WORD = re.compile(r"\bhealth\w*")
+_HEALTH_FIGURE = re.compile(
+    r"\btherapeutic\b|\b(?:like|retail|kind of|sort of|a form of|my kind of) therapy\b"
+    r"|\btherapy for (?:me|the soul|my soul)\b"
+)
+
+
+_ARRIVAL_RULED = frozenset({Label.HEALTH, Label.MINOR})  # labels set by the two rules below
+
+
+def _arrival_health(t: str, ws: list[str]) -> tuple[bool, bool]:
+    """(strong, weak) `health` at arrival from the normalised text `t` and its words."""
+    lex = _STRONG[Label.HEALTH]
+    if not _hits(ws, lex):
+        return False, _hits(ws, _WEAK[Label.HEALTH])
+    plain = words(_HEALTH_FIGURE.sub(" ", t))
+    if not _hits(plain, lex):
+        return False, _hits(ws, _WEAK[Label.HEALTH])
+    if _hits(words(_HEALTH_WORD.sub(" ", " ".join(plain))), lex):
+        return True, False
+    return False, True
+
+
+def _arrival_minor(t: str, text: str, other: Label) -> tuple[bool, bool]:
+    """(strong, weak) `minor` at arrival: a child word with a detail about the child, or with
+    another sensitive label of the same text (`other`), is strong; a bare mention is weak."""
+    cw = words(_CHILD_NOT.sub(" ", t))
+    if not _hits(cw, _STRONG[Label.MINOR]):
+        return False, _hits(cw, _WEAK[Label.MINOR])
+    if other or _hits(cw, _CHILD_DETAIL) or _hits(cw, _WEAK[Label.MINOR]):
+        return True, False
+    if _CHILD_AGE.search(text or ""):
+        return True, False
+    return False, True
+
 
 # Situation domains for "applicability matches" of the user's own items (§5.5): an allergy
 # applies to a food order, not to the weather.
@@ -803,14 +879,15 @@ def classifier_ready() -> bool:
 
 def _lexicon_pass(text: str, entity_types: list[str] | None) -> tuple[Label, bool]:
     """(labels, weak) from lexicons, entity types and patterns alone."""
+    t = norm(text)
     ws = words(text)
     out = Label.NONE
     weak = False
     for lbl, lex in _STRONG.items():
-        if _hits(ws, lex):
+        if lbl not in _ARRIVAL_RULED and _hits(ws, lex):
             out |= lbl
     for lbl, lex in _WEAK.items():
-        if not out & lbl and _hits(ws, lex):
+        if lbl not in _ARRIVAL_RULED and not out & lbl and _hits(ws, lex):
             weak = True
     for et in entity_types or []:
         out |= _ETYPE_LABELS.get(norm(et), Label.NONE)
@@ -818,6 +895,12 @@ def _lexicon_pass(text: str, entity_types: list[str] | None) -> tuple[Label, boo
         out |= Label.MONEY
     if _PRECISE_ADDR.search(text or ""):
         out |= Label.LOCATION_PRECISE
+    strong, soft = _arrival_health(t, ws)
+    out |= Label.HEALTH if strong else Label.NONE
+    weak = weak or (soft and not out & Label.HEALTH)
+    strong, soft = _arrival_minor(t, text, out & ALL_LABELS & ~Label.MINOR)
+    out |= Label.MINOR if strong else Label.NONE
+    weak = weak or (soft and not out & Label.MINOR)
     return out, weak
 
 
@@ -1052,6 +1135,15 @@ def _route_labels(labels: Label, final: bool) -> Label:
     return labels
 
 
+def _uncertain_only(labels: Label, final: bool, sens_mask: Label) -> bool:
+    """Final labels whose sensitive part is only the uncertain band: the classifier finished,
+    scored in [LOW, HIGH) and named no topic, so the item is not known to be sensitive. A
+    confident label beside the bit, a reserved bit, or labels still pending say otherwise."""
+    if not final or int(labels) >> len(LABEL_NAMES):
+        return False
+    return int(labels & sens_mask) == int(Label.UNKNOWN_SENSITIVE)
+
+
 def _routes_for(labels: Label) -> set[Route]:
     table = routing_table()
     if not labels:
@@ -1228,6 +1320,57 @@ def _topic_exclude(
     return _entity_names(conn, people) if people else subject_names
 
 
+# question words that carry no content of their own (shorter ones never count, see `_content_words`)
+_ASK_TEXT = (
+    "does which whose whom many much kind sort type both ever doing done tell know"
+    " почему зачем откуда сколько какая какие каком какую чего кого кому чем кто что"
+)
+_ASK_WORDS = frozenset(norm(w) for w in _ASK_TEXT.split())
+
+
+def _content_words(text: str, ws: list[str], exclude: Iterable[str]) -> list[str]:
+    """The user's content words, one per stem: four letters or more, no stop or question word, no
+    name. A name is a word of `exclude` (the subject's names) or a capitalised word inside a
+    sentence (other people the user names); a name alone is no content (§5.5)."""
+    toks = (text or "").split()
+    proper: set[str] = set()
+    for k, tok in enumerate(toks):
+        if k and tok[:1].isupper() and not toks[k - 1].endswith((".", "!", "?")):
+            letters = [ch for ch in tok if ch.isalpha()]
+            if len(letters) >= 3 and all(ch.isupper() for ch in letters):
+                continue  # an acronym («LGBTQ», «ADHD») is a topic, not a name
+            proper.update(words(tok))
+    names_ = [t for name in exclude for t in words(name)]
+    out: dict[str, str] = {}
+    for w in ws:
+        if len(w) < 4 or w.isdigit() or w in _STOP or w in _ASK_WORDS or w in proper:
+            continue
+        if any(_name_token_match(n, w) for n in names_):
+            continue
+        out.setdefault(_stem(w), w)
+    return list(out.values())
+
+
+def _asks_content(
+    item: _Src, turn: TurnCtx, ws: list[str], exclude: list[str], missing: Label
+) -> bool:
+    """§5.5 a direct question by content: their words ask this message's own words, so the
+    label does not need its topic word in the question («how did Kim get hurt?» asks the
+    message «I got hurt at work» whether the classifier or the word «injury» set `health`).
+
+    Only a raw message whose labels are final qualifies (its labels came from that very text);
+    the open-topic labels keep their own test (it already is the message's own words). The
+    caller has checked the subject is named and the turn sends nothing."""
+    if item.src is not ReadSrc.RAW or not item.final or not missing or missing & OPEN_TOPIC:
+        return False
+    asked = _content_words(turn_words(turn), ws, exclude)
+    if len(asked) < CONTENT_MIN:
+        return False
+    terms = _terms(item.text)
+    hit = [w for w in asked if any(t.startswith(_stem(w)) or w.startswith(_stem(t)) for t in terms)]
+    return len(hit) >= CONTENT_MIN and len(hit) >= CONTENT_SHARE * len(asked)
+
+
 def _asked(held: Label, ws: list[str], item: _Src, names_: list[str]) -> bool:
     terms = _terms(item.text)
     return all(topic_hit(b, ws, item_terms=terms, exclude=names_) for b in bits(held))
@@ -1258,18 +1401,44 @@ def _decide(
             allowed, reason = True, "own_neutral"
         elif _applies(item, ws, turn_dom):
             allowed, reason, note = True, "own_applies", note_for(item.quote)
+        elif item.final and not sens & ~OWN_RANKED:
+            # the classifier finished and named no topic (unsure, or someone else's matter
+            # in the user's words): no proof the item does not apply, so whether it fits this
+            # turn is a ranking question, never a denial; send turns still hold it. A label
+            # still pending is not yet known and keeps the applicability test until it lands.
+            allowed, reason, note = True, "own_ranked", note_for(item.quote)
         else:
             allowed, reason = False, "own_not_applicable"
     else:
         subject_names = _entity_names(conn, item.subjects)
         terms = _terms(item.text)
         excl = _topic_exclude(conn, item.subjects, ws, targets, subject_names)
-        topic = all(topic_hit(b, ws, item_terms=terms, exclude=excl) for b in bits(sens))
+        missing = Label.NONE
+        for b in bits(sens):
+            if not topic_hit(b, ws, item_terms=terms, exclude=excl):
+                missing |= b
+        topic = not missing
         # the question's target resolved to its entity (aliases, nicknames, the other script)
         # names the subject as well as the user's literal words do; the topic test stays (§5.5)
         named = names_in(ws, subject_names) or bool(targets & set(item.subjects))
         allowed = topic and named
         reason = "direct_question" if allowed else ("name_only" if named else "not_asked")
+        if (
+            named
+            and not allowed
+            and not send
+            and not _uncertain_only(item.labels, item.final, sens_mask)
+            and _asks_content(item, turn, ws, excl, missing)
+        ):
+            # the user names whom the message is about and asks its own words: a direct
+            # question about that message, never on a send turn
+            allowed, reason = True, "direct_content"
+        if not allowed and _uncertain_only(item.labels, item.final, sens_mask):
+            # another person's item the classifier finished unsure about: not known to be
+            # sensitive, so relevance ranks it like an unlabeled one (the same reading as its
+            # route) even though the name and topic test did not pass; the basket ranks it
+            # among the clean lines by its score, and send turns still hold it
+            allowed, reason = True, "uncertain_ranked"
     if not allowed:
         return Use(False, reason)
     hold = bool(send and held and not _asked(held, ws, item, _entity_names(conn, item.subjects)))
@@ -1341,7 +1510,9 @@ def label_mask(turn: TurnCtx) -> Label:
     Every non-sensitive label, plus each sensitive label whose topic their words hit; the
     open-topic labels whenever the user says anything (their topic is the item's own words).
     The user's own items pass the SQL whatever their labels (see `mask_clause`): applicability
-    is checked by `decide`. A superset of what `decide` allows, never a subset."""
+    is checked by `decide`. A superset of what `decide` allows, except another person's raw
+    message opened by its own words (`_asks_content`): the basket's raw finder brings those
+    past this mask when the question names someone, and `decide` rules on each."""
     sens = sensitive_mask()
     ws = words(turn_words(turn))
     mask = ALL_LABELS & ~sens

@@ -188,8 +188,10 @@ def test_real_unbuilt_api_names_the_lanes_and_grades_the_rest():
     res = Runner(scn, PERSONAS, sut=ApiSUT(), seed=1).run()
     assert res.not_built and all(isinstance(x, str) for x in res.not_built)
     w = res.probes[0].wordings[0]
-    assert w.status == "fail"  # no model: nothing extracts, so the wording fails on a real check
-    assert not w.reasons[0].startswith("not built:")  # graded, not blanket-failed
+    # no model, nothing extracts: the user's own messages still answer, the correction having marked
+    # the old city in the user's earlier message - graded on its real checks, not blanket-failed
+    assert w.status == "pass", w.reasons
+    assert not any(r.startswith("not built:") for r in w.reasons)
     if res.pipeline_gaps:  # a failure next to a stage that is still unbuilt names it
         assert "pipeline not built" in w.reasons[0]
 

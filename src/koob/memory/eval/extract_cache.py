@@ -260,7 +260,9 @@ class CachedProcessor:
         return out
 
 
-def make_processor(mode: str, *, root: Path | None = None) -> CachedProcessor | None:
+def make_processor(
+    mode: str, *, root: Path | None = None, model: str | None = None
+) -> CachedProcessor | None:
     """The cached processor for `--extract`; None for `off`. Never called from pytest with
     cloud/local (tests pass a fake through `ApiSUT(processor=...)`)."""
     if mode == "off":
@@ -268,7 +270,7 @@ def make_processor(mode: str, *, root: Path | None = None) -> CachedProcessor | 
     from ..workers import extract
 
     if mode == "cloud":
-        return CachedProcessor(extract.CloudExtractor(), root)
+        return CachedProcessor(extract.CloudExtractor(model), root)
     if mode == "local":
         return CachedProcessor(extract.OllamaExtractor(), root)
     raise ValueError(f"--extract: one of {', '.join(MODES)}")

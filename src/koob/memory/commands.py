@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import entities, forget, ledger, policy, store
 from .model import (
+    OWNER_ENTITY_ID,
     USABLE,
     AnyRecord,
     AuthorTier,
@@ -883,7 +884,7 @@ def _usable(rec: AnyRecord, *, include_archived: bool = True) -> bool:
 # ---------------------------------------------------------------- served set (§10.4, §7.6)
 
 
-def _serve(conn: sqlite3.Connection, turn: TurnCtx, recs: Sequence[AnyRecord]) -> None:
+def _serve(conn: sqlite3.Connection, turn: TurnCtx, recs: Sequence[AnyRecord | Item]) -> None:
     """Every item the brain gets writes a `served` row (§10.4): a later forget restarts the
     sessions that saw it (§9.1c). `cb memory` turns have no session."""
     if not recs or turn.thread_id == CLI_THREAD:
@@ -894,10 +895,23 @@ def _serve(conn: sqlite3.Connection, turn: TurnCtx, recs: Sequence[AnyRecord]) -
             "INSERT INTO served (thread_id, session_id, item_id, item_kind, version, turn_id, via,"
             " created_at) VALUES (?, ?, ?, ?, ?, ?, 'tool', ?)",
             [
-                (turn.thread_id, turn.session_id, r.id, r.kind.value, r.version, turn.turn_id, now)
+                (
+                    turn.thread_id,
+                    turn.session_id,
+                    r.id,
+                    _kind_name(r.kind),
+                    r.version,
+                    turn.turn_id,
+                    now,
+                )
                 for r in recs
             ],
         )
+
+
+def _kind_name(kind: Any) -> str:
+    """A record kind's value; a raw message's kind is the string `raw`."""
+    return str(getattr(kind, "value", kind))
 
 
 # ---------------------------------------------------------------- finding (resolve + lexical)
@@ -975,6 +989,7 @@ class _Found:
     terms: list[str] = field(default_factory=list)
     scored: list[tuple[float, str]] = field(default_factory=list)  # (score, record id)
     recs: dict[str, AnyRecord] = field(default_factory=dict)
+    raw: str | None = None  # the user's own message, when no record holds what the user described
 
 
 def _founding_names(conn: sqlite3.Connection, entity_id: str) -> set[str]:
@@ -1686,6 +1701,11 @@ def get_item(conn: sqlite3.Connection, item_id: str, turn: TurnCtx) -> Item | No
     return _item(rec, _names(conn, [_speaker(rec)]), use)
 
 
+SEARCH_TOKENS = 1_200  # the search result's item texts stay within this many tokens
+_TOKEN_CHARS = 4  # characters a token, the basket's measure
+_LINE_FRAME = 12  # tokens a result line spends on its handle, date and tags
+
+
 def search(
     conn: sqlite3.Connection,
     query: str,
@@ -1695,29 +1715,75 @@ def search(
     as_of: str | None = None,
     include_archived: bool = False,
     limit: int = 20,
+    max_tokens: int = SEARCH_TOKENS,
 ) -> list[Item]:
-    """`api.search`, lexical only (no fusion or vectors yet): names through resolve,
-    other words through FTS; use-now before rank; send turns mark held items."""
+    """`api.search`: four finders fused by RRF (§10.2 step 4). Records by their words (names
+    through resolve, other words through FTS) and by meaning; raw messages by their words
+    (the named senders' messages first) and by meaning. Everything found passes the basket's
+    truth and policy checks under the turn's own words (`basket.vet`: forgotten, overtaken,
+    ended, frozen, use-now with sensitive-not-asked); records keep their search filters
+    (`kinds`, `as_of`, `include_archived`), and raws come only when no record filter is set.
+    At most `limit` items whose texts fit `max_tokens`; send turns mark held items."""
+    from .recall import basket, fusion
+
     found = _find(conn, query, include_archived=include_archived, min_cover=0.0)
     if found.terms:
-        ids = [rid for _s, rid in found.scored]
+        lex_ids = [rid for _s, rid in found.scored]
     else:
-        ids = _about(conn, [e.entity_id for e in found.entities])
-    recs = _records(conn, ids)
-    keep = [
-        recs[i]
-        for i in ids
-        if i in recs
-        and recs[i].kind is not RecordKind.ENTITY
-        and _usable(recs[i], include_archived=include_archived)
-        and (not kinds or recs[i].kind in kinds)
-        and (not as_of or (recs[i].recorded_at or "") <= as_of)
-    ]
-    uses = policy.decide_many(conn, [r.id for r in keep], turn) if keep else {}
-    keep = [r for r in keep if uses[r.id].allowed][:limit]
-    _serve(conn, turn, keep)
-    names = _names(conn, [_speaker(r) for r in keep])
-    return [_item(r, names, uses[r.id]) for r in keep]
+        lex_ids = _about(conn, [e.entity_id for e in found.entities])
+    raws_too = not kinds and not as_of
+    authors = [e.entity_id for e in found.entities]
+    more = basket.search_lanes(
+        conn, query, label_mask=int(policy.label_mask(turn)), authors=authors
+    )
+    vec_ids = [i for i, _ in more["vector"]]
+    recs = _records(conn, [*lex_ids, *vec_ids])
+
+    def fits(rid: str) -> bool:
+        r = recs.get(rid)
+        return (
+            r is not None
+            and r.kind is not RecordKind.ENTITY
+            and _usable(r, include_archived=include_archived)
+            and (not kinds or r.kind in kinds)
+            and (not as_of or (r.recorded_at or "") <= as_of)
+        )
+
+    lanes = {
+        "lexical": [(i, 1.0) for i in lex_ids if fits(i)],
+        "vector": [h for h in more["vector"] if fits(h[0])],
+    }
+    if raws_too:
+        lanes["raw"], lanes["rawvec"] = more["raw"], more["rawvec"]
+    lanes = {n: hits for n, hits in lanes.items() if hits}
+    vetted, uses = basket.vet(conn, turn, lanes) if lanes else ({}, {})
+    names: dict[str, str] = {}
+    keep_recs = [recs[i] for i in vetted if i in recs]
+    if keep_recs:
+        names = _names(conn, [_speaker(r) for r in keep_recs])
+    out: list[Item] = []
+    left = max_tokens
+    for rid, _score in fusion.rrf(
+        {n: [h for h in hits if h[0] in vetted] for n, hits in lanes.items()}
+    ):
+        rec = recs.get(rid)
+        if rec is not None and "[сменилось]" not in vetted[rid].text:
+            item = _item(rec, names, uses[rid])
+        elif (
+            rec is not None or raws_too and vetted[rid].kind == "raw"
+        ):  # a revised value cut by the basket's truth overlay
+            item = vetted[rid]
+        else:
+            continue
+        cost = len(item.text) // _TOKEN_CHARS + _LINE_FRAME
+        if out and cost > left:
+            break
+        out.append(item)
+        left -= cost
+        if len(out) >= limit:
+            break
+    _serve(conn, turn, out)
+    return out
 
 
 # ---------------------------------------------------------------- where from (§17)
@@ -2556,6 +2622,96 @@ def _one_topic(conn: sqlite3.Connection, recs: Sequence[AnyRecord]) -> bool:
     return len({links.find(r.id) for r in recs}) == 1
 
 
+_DERIVED_KINDS = frozenset({RecordKind.EPISODE, RecordKind.INTENTION, RecordKind.IMPRESSION})
+
+
+def _derived(rec: AnyRecord) -> bool:
+    """A record the system built from others (a night-job episode, an inferred intention or
+    impression), not one the user's or anyone's words stated."""
+    return rec.kind is RecordKind.EPISODE or (
+        rec.kind in _DERIVED_KINDS and AuthorTier(rec.author_tier) is AuthorTier.SYSTEM
+    )
+
+
+def _built_from(conn: sqlite3.Connection, rid: str) -> set[str]:
+    """Every record and message `rid` was built from (`derived_from`, to a fixpoint)."""
+    out: set[str] = set()
+    frontier = {rid}
+    for _ in range(6):
+        if not frontier:
+            break
+        marks = ",".join("?" * len(frontier))
+        nxt = {
+            r[0]
+            for r in conn.execute(
+                f"SELECT to_id FROM edges WHERE from_id IN ({marks})"  # noqa: S608
+                " AND etype = 'derived_from'",
+                sorted(frontier),
+            )
+        }
+        frontier = nxt - out - {rid}
+        out |= frontier
+    return out
+
+
+def _event_entities(conn: sqlite3.Connection, ids: Iterable[str]) -> set[str]:
+    ids = sorted(set(ids))
+    if not ids:
+        return set()
+    marks = ",".join("?" * len(ids))
+    rows = conn.execute(
+        f"SELECT subject_id, value_entity_id FROM facts WHERE id IN ({marks})"  # noqa: S608
+        f" UNION SELECT to_id, NULL FROM edges WHERE from_id IN ({marks})"  # noqa: S608
+        " AND etype IN ('mentions', 'about')",
+        [*ids, *ids],
+    ).fetchall()
+    return {x for r in rows for x in r if x and x != OWNER_ENTITY_ID}
+
+
+def _subjects(conn: sqlite3.Connection, ids: Iterable[str]) -> set[str]:
+    ids = sorted(set(ids))
+    if not ids:
+        return set()
+    marks = ",".join("?" * len(ids))
+    sql = f"SELECT subject_id FROM facts WHERE id IN ({marks})"  # noqa: S608
+    return {r[0] for r in conn.execute(sql, ids) if r[0]}
+
+
+def _split_kin(
+    conn: sqlite3.Connection, recs: Sequence[AnyRecord]
+) -> tuple[list[AnyRecord], list[AnyRecord]]:
+    """(the stated records among tied forget candidates, the derived records about the same
+    event as one of them). A derived record is kin of a stated one when it was built from it,
+    from a record of the same message, or names the same person or thing; kin is forgotten
+    with the stated record, never offered as a rival. A derived record tied with no stated
+    record linked to it stays among the stated ones (a real choice)."""
+    stated = [r for r in recs if not _derived(r)]
+    if not stated or len(stated) == len(recs):
+        return list(recs), []
+    ids = {r.id for r in stated}
+    raws = {x for r in stated for x in _lineage(conn, r.id)}
+    ents = _event_entities(conn, ids)
+    # one stated record: a derived one built from facts about the same subject (the user
+    # included) that the user's words name as fully is about the same thing
+    subj = {getattr(r, "subject_id", None) for r in stated} - {None} if len(stated) == 1 else set()
+    kin: list[AnyRecord] = []
+    for r in recs:
+        if not _derived(r):
+            continue
+        base = _built_from(conn, r.id)
+        base_raws = {x for b in {r.id, *base} for x in _lineage(conn, b)}
+        if (
+            base & ids
+            or base_raws & raws
+            or _event_entities(conn, {r.id, *base}) & ents
+            or (subj and _subjects(conn, base) & subj)
+        ):
+            kin.append(r)
+        else:
+            stated.append(r)
+    return stated, kin
+
+
 def _topic_target(
     conn: sqlite3.Connection,
     named: Sequence[entities.Resolved],
@@ -2620,11 +2776,18 @@ def _resolve_target(
             recs=[rec] if rec else [],
             title=f"всё про «{e.display_name}»",
         )
-    if whole:  # «всё про <topic>»: every record and message of the topic
-        return _topic_target(conn, named, rest, query, turn)
-    found = _find(conn, query, include_history=True)
-    if not found.scored:  # a topic word, not one fact («забудь про накопления»)
-        return _topic_target(conn, named, rest, query, turn)
+    found = _Found(query=query) if whole else _find(conn, query, include_history=True)
+    # «всё про <topic>»: every record and message of the topic; a topic word, not one fact
+    # («забудь про накопления»); else what the user's words describe, found by meaning
+    if whole or not found.scored:
+        topic = _topic_target(conn, named, rest, query, turn)
+        if not topic.missing:
+            return topic
+        found = _loose_find(conn, query, turn)
+        if found.raw is not None:  # nothing learned from it yet: the message itself goes
+            return _Target(ids=[found.raw], scope=ForgetScope.ITEM)
+        if not found.scored:
+            return topic
     if slot is not None or plan:
         found.scored = sorted(
             (
@@ -2645,12 +2808,96 @@ def _resolve_target(
     # rival values of one slot, or things from unrelated messages
     if len(top) > 1 and not forget.same_fact(conn, top):
         tied = [found.recs[i] for i in top]
+        stated, kin = _split_kin(conn, tied)
+        if kin and (
+            len(stated) == 1
+            or forget.same_fact(conn, [r.id for r in stated])
+            or _one_topic(conn, stated)
+        ):
+            recs = [*stated, *kin]
+            return _Target(
+                ids=[r.id for r in recs], scope=ForgetScope.ITEM, recs=recs, one_fact=True
+            )
         if not _one_topic(conn, tied):
             return _Target(ask=_ask_records(conn, tied, turn))
         return _Target(ids=top, scope=ForgetScope.ITEM, recs=tied)
     return _Target(
         ids=top, scope=ForgetScope.ITEM, recs=[found.recs[i] for i in top], one_fact=len(top) > 1
     )
+
+
+def _loose_find(conn: sqlite3.Connection, query: str, turn: TurnCtx | None = None) -> _Found:
+    """A forget's last resort, found the way recall finds an item: half of the user's content words
+    («the number of my locker» names the locker code by «locker»), else the meaning lane with
+    the evidence bar the basket serves a meaning-only hit at (a description of the item, a
+    paraphrase, another language): the closest usable record, one item even when several
+    come close (its kin go with it; «Вернуть» undoes a wrong pick). When no record holds it
+    (no worker has learned from the user's message yet), the user's own message closest in
+    meaning. A forget of something recall would serve never ends with nothing forgotten."""
+    found = _find(conn, query, include_history=True, min_cover=0.5)
+    if found.scored:
+        return found
+    from .recall import basket, vectors
+
+    vec = vectors.embed_query(query)
+    if not vec:
+        return found
+    hits, raw_hits = _meaning_hits(vec)
+    recs = _records(conn, [i for i, s in hits if s >= basket.VEC_EVIDENCE])
+    for rid, score in hits:
+        rec = recs.get(rid)
+        if rec is None or rec.kind is RecordKind.ENTITY or not _usable(rec):
+            continue
+        found.scored.append((score, rid))
+        found.recs[rid] = rec
+    found.scored.sort(key=lambda s: (-s[0], s[1]))
+    found.scored = found.scored[:1]
+    if not found.scored:
+        found.raw = _own_raw(conn, raw_hits, turn)
+    return found
+
+
+def _meaning_hits(vec: list[float]) -> tuple[list[tuple[str, float]], list[tuple[str, float]]]:
+    """Records and raw messages by meaning. A command may wait for the index: a forget that
+    runs before any recall loaded it reads it now instead of finding nothing."""
+    from .recall import vectors
+
+    hits, raws = vectors.search_split(vec, label_mask=-1, deadline_ms=200.0, limit=8, raw_limit=8)
+    if not hits and not raws and vectors.load_index():
+        hits, raws = vectors.search_split(
+            vec, label_mask=-1, deadline_ms=200.0, limit=8, raw_limit=8
+        )
+    return hits, raws
+
+
+def _own_raw(
+    conn: sqlite3.Connection, raw_hits: list[tuple[str, float]], turn: TurnCtx | None
+) -> str | None:
+    """The user's own earlier message closest in meaning, above the raw lane's floor: not a
+    message of this turn and not itself an order to forget."""
+    from .recall import basket
+
+    ok = [(i, s) for i, s in raw_hits if s >= max(basket.RAW_VEC_MIN, basket.VEC_EVIDENCE)]
+    if not ok:
+        return None
+    ids = [i for i, _ in ok]
+    own = tuple(t.value for t in ledger.USER_TIERS)
+    rows = {
+        r["id"]: r
+        for r in conn.execute(
+            "SELECT id, turn_id, text FROM raw_chunks WHERE status = 'active' AND quarantined = 0"
+            f" AND author_tier IN (?, ?) AND id IN ({', '.join('?' for _ in ids)})",  # noqa: S608
+            (*own, *ids),
+        )
+    }
+    for rid, _s in sorted(ok, key=lambda h: (-h[1], h[0])):
+        r = rows.get(rid)
+        if r is None or (turn is not None and r["turn_id"] == turn.turn_id):
+            continue
+        if _FORGET_VERB.search(r["text"] or ""):
+            continue
+        return rid
+    return None
 
 
 def _affected(conn: sqlite3.Connection, payload: dict[str, Any]) -> tuple[list[str], list[str]]:

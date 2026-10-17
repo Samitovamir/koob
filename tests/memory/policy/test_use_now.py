@@ -67,7 +67,7 @@ def world(db):
         subject="e-sasha",
         text_en="Sasha plans to leave the company",
         quote="скоро уйду из компании",
-        labels=Label.UNKNOWN_SENSITIVE,
+        labels=Label.THIRD_PARTY_PRIVATE,  # a confident open-topic label
         tier="other",
         author="e-sasha",
     )

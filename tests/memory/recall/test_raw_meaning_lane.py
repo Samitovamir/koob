@@ -195,7 +195,7 @@ def test_a_redacted_message_is_embedded_again_from_its_new_text(conn):
         ver = vdb.execute("SELECT version FROM vectors WHERE record_id = 'r-keys'").fetchone()[0]
     finally:
         vdb.close()
-    assert ver == 2
+    assert ver == vectors.raw_version(2)
     q = vectors.embed_query("garage keys")
     assert vectors.search_split(q, label_mask=-1, limit=0, raw_limit=1)[1][0][1] < 0.5
 

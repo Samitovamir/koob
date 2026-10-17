@@ -1787,7 +1787,8 @@ def check_retracted(
             rv += [
                 r[0]
                 for r in conn.execute(
-                    f"SELECT retracted_value_norm FROM raw_retractions WHERE {col} IN ({marks})",  # noqa: S608
+                    f"SELECT retracted_value_norm FROM raw_retractions WHERE {col} IN ({marks})"  # noqa: S608
+                    " AND record_id NOT LIKE 'fix:%'",  # a correction's own mark: read-side only
                     chunk,
                 )
             ]

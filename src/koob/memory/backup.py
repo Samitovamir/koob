@@ -574,6 +574,8 @@ def restore_report(
         # (4) the sweep from the set's watermark
         if sweep is not None:
             report.swept = sweep(conn)
+        # a forget always wins: what the hot log or the sweep brought back is forgotten again
+        forget.reassert_journal(conn, lines)
         # (5) vectors are rebuilt, never restored
         if paths.vectors.exists():
             _remove_db_files(paths.vectors)

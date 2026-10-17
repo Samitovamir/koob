@@ -121,6 +121,48 @@ def test_raw_with_only_the_overtaken_view_is_not_quoted(conn):
     assert _older(conn, ["i-mar", "raw-mar"], "Марат доведёт дело?") == {"i-mar", "raw-mar"}
 
 
+def _learned(conn, rid: str, text: str, day: str, imp: Impression) -> None:
+    raw(conn, rid, text, ts_=f"{day}T10:00:00Z")
+    assert add(conn, imp).ok
+    conn.execute(
+        "INSERT INTO edges (from_id, to_id, etype, created_at) VALUES (?, ?, 'derived_from', ?)",
+        (imp.id, rid, ts()),
+    )
+
+
+def test_retraction_in_the_source_message_overtakes_the_old_raw(conn):
+    """The new view's quote keeps only «she ran the launch»; the take-back said before it in
+    the same message still proves the old view wrong, so the old message is not quoted."""
+    assert add(conn, entity("e-den", "Денис")).ok
+    _learned(conn, "raw-old", "Денис милый, но всё время срывает сроки.", "2026-02-01",
+             _imp("i-old", "e-den", "2026-02-01", "Denis keeps missing deadlines.",
+                  "Денис милый, но всё время срывает сроки."))  # fmt: skip
+    _learned(conn, "raw-new", "Беру назад про Дениса. Он один вытянул запуск.", "2026-06-01",
+             _imp("i-new", "e-den", "2026-06-01", "Denis ran the launch alone.",
+                  "Он один вытянул запуск."))  # fmt: skip
+    # the question reaches only the old message
+    rows = basket._hydrate(conn, ["raw-old"], CLOCK[:10])
+    c = cue.parse(t("Денису можно поручить срочное?"), now=CLOCK, conn=conn)
+    assert basket._older_impressions(rows, set(rows), c, conn, any_view=True) == {"raw-old"}
+
+
+def test_newer_view_without_take_back_in_its_message_keeps_the_old_raw(conn):
+    assert add(conn, entity("e-den", "Денис")).ok
+    _learned(conn, "raw-old", "Денис милый, но всё время срывает сроки.", "2026-02-01",
+             _imp("i-old", "e-den", "2026-02-01", "Denis keeps missing deadlines.",
+                  "Денис милый, но всё время срывает сроки."))  # fmt: skip
+    _learned(
+        conn,
+        "raw-new",
+        "Денис классно рисует.",
+        "2026-06-01",
+        _imp("i-new", "e-den", "2026-06-01", "Denis draws well.", "Денис классно рисует."),
+    )
+    rows = basket._hydrate(conn, ["raw-old"], CLOCK[:10])
+    c = cue.parse(t("Денису можно поручить срочное?"), now=CLOCK, conn=conn)
+    assert basket._older_impressions(rows, set(rows), c, conn, any_view=True) == set()
+
+
 def test_retraction_lexicon_reads_both_languages():
     for text in (
         "Беру назад про Олю, она молодец.",

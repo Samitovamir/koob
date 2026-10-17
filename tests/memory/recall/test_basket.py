@@ -192,13 +192,14 @@ def test_author_tier_shown(conn):
 
 
 def test_budget_and_dedupe(conn):
-    """≤ 1.5k tokens, ≤ MAX_ITEMS lines, ≤ PER_ENTITY per person, one value per slot."""
+    """≤ 1.5k tokens and the broad line cap; the person asked about is the question's
+    matter, so PER_ENTITY does not cut his lines (it limits people the question does not name)."""
     assert add(conn, entity("e-sasha", "Саша")).ok
     long = "Sasha said a lot about the new flat and the move " * 12
     for k in range(12):
         assert add(conn, fact(f"f-{k}", "e-sasha", f"note{k}", str(k), text=f"{long} {k}")).ok
     b = api.recall(t("что там у Саши"), store=conn)
-    assert 0 < len(b.items) <= gate.PER_ENTITY
+    assert gate.PER_ENTITY < len(b.items) <= gate.MAX_ITEMS_BROAD
     assert b.tokens <= 1500
     assert all(len(i.text) <= basket.LINE_CHARS for i in b.items)
 

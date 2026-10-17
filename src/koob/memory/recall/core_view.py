@@ -45,7 +45,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from .. import clock as _clock
-from .. import entities, justify, ledger, policy, store
+from .. import entities, forget, justify, ledger, policy, store
 from ..model import (
     OWNER_ENTITY_ID,
     AuthorTier,
@@ -332,12 +332,15 @@ def _entity_ref(ctx: _Ctx, eid: str | None) -> ReadRef | None:
 
 
 def _fence(ctx: _Ctx, rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
-    """Use-now with the neutral turn, frozen items out, others' precise places out, and
-    topic-sensitive items out even when they are the user's own."""
+    """Use-now with the neutral turn, frozen items out, items a forget holds out (every
+    section passes here), others' precise places out, and topic-sensitive items out even
+    when they are the user's own."""
+    gone = forget.hidden_by_forget(ctx.conn, [r["id"] for r in rows]) if rows else set()
     rows = [
         r
         for r in rows
         if r["id"] not in ctx.frozen
+        and r["id"] not in gone
         and not Label(int(r["labels"])) & ctx.sensitive
         and not (ctx.sensitive and _topic_words(ctx, r["id"]))
     ]
@@ -882,30 +885,44 @@ def _people(ctx: _Ctx) -> list[Line]:
     rows = [r for r in rows if r["id"] in touch and _days(ctx, touch[r["id"]]) <= WINDOW_DAYS]
     rows.sort(key=lambda r: r["id"])
     rows.sort(key=score, reverse=True)
-    people = _fence(ctx, rows[: PEOPLE_CAP * 2])[:PEOPLE_CAP]
+    hush = forget.suppressed_texts(conn, [r["display_name"] for r in rows[: PEOPLE_CAP * 2]])
+    people = [p for p in _fence(ctx, rows[: PEOPLE_CAP * 2]) if p["display_name"] not in hush]
+    people = people[:PEOPLE_CAP]
     lines: list[Line] = []
+    facts_of: dict[str, list[sqlite3.Row]] = {}
     for p in people:
         eid = p["id"]
-        refs = [_ref(p)]
-        shown = p["display_name"].casefold()
-        aka: dict[str, str] = {}
-        for a in conn.execute(
-            "SELECT alias, alias_norm FROM aliases WHERE entity_id = ?"
-            " AND kind NOT IN ('handle', 'translit')"
-            " ORDER BY alias_norm, id",
-            (eid,),
-        ):
-            if a["alias_norm"] != shown and a["alias_norm"] not in _PRONOUNS:
-                aka.setdefault(a["alias_norm"], a["alias"])
         facts = conn.execute(
             f"SELECT {_FACT_COLS} FROM facts f JOIN records r ON r.id = f.id"  # noqa: S608
             " WHERE f.subject_id = ? AND r.status = 'active' AND r.kind IN ('fact', 'preference')"
             " ORDER BY coalesce(r.importance, 0.5) DESC, r.recorded_at DESC, r.id LIMIT 12",
             (eid,),
         ).fetchall()
-        facts = [
+        facts_of[eid] = [
             f for f in _fence(ctx, facts) if _current(ctx, f) and _applies_now(ctx, f, scoped=False)
         ]
+    # a fact carrying a value the user's later message revised in the message it was learned
+    # from (or in the fact it was inferred from) is overtaken, even before a worker supersedes it
+    from . import basket
+
+    gone = basket.overtaken_records(conn, [f["id"] for fs in facts_of.values() for f in fs])
+    for p in people:
+        eid = p["id"]
+        refs = [_ref(p)]
+        shown = p["display_name"].casefold()
+        aka: dict[str, str] = {}
+        names = conn.execute(
+            "SELECT alias, alias_norm FROM aliases WHERE entity_id = ?"
+            " AND kind NOT IN ('handle', 'translit')"
+            " ORDER BY alias_norm, id",
+            (eid,),
+        ).fetchall()
+        hush = forget.suppressed_texts(conn, [a["alias"] for a in names])  # a forgotten value
+        for a in names:
+            norm = a["alias_norm"]
+            if norm != shown and norm not in _PRONOUNS and a["alias"] not in hush:
+                aka.setdefault(norm, a["alias"])
+        facts = [f for f in facts_of[eid] if f["id"] not in gone]
         facts = _drop_overridden(ctx, facts)[:FACTS_PER_PERSON]
         facts.sort(key=lambda f: (f["recorded_at"], f["id"]))
         text = _short(p["display_name"], 80)
