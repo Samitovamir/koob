@@ -108,6 +108,14 @@ def test_value_tokens_cover_dates_numbers_emails():
     assert t("+7 (912) 345-67-89") & t("89123456789")
 
 
+def test_value_tokens_amount_after_a_month_is_not_a_day():
+    t = ledger.value_tokens
+    assert t("с января 12 тысяч") == {"num:12"}
+    assert not any(x.startswith("date:") for x in t("since January 12k"))
+    assert t("с мая 40%") == {"num:40"}
+    assert "date:01-12" in t("January 12 at noon")
+
+
 def test_supersede_by_life_change_is_not_a_retraction(conn):
     """Moving is not "it was wrong": no overlay, the old value may still be told as history."""
     assert add(conn, fact("f-msk", "e-s", "lives_in", "Moscow")).ok

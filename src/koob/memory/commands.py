@@ -38,6 +38,7 @@ from .model import (
     TurnCtx,
     TurnOrigin,
 )
+from .recall import safe_text
 from .writers import hot
 
 if TYPE_CHECKING:
@@ -61,6 +62,19 @@ _KIND_TITLE: dict[RecordKind, str] = {
     RecordKind.CRITERION: "Критерии",
     RecordKind.WORK_STATE: "Работа",
     RecordKind.ENTITY: "Люди и вещи",
+}
+_KIND_TITLE_EN: dict[RecordKind, str] = {
+    RecordKind.FACT: "Facts and plans",
+    RecordKind.PREFERENCE: "Preferences",
+    RecordKind.IMPRESSION: "Impressions",
+    RecordKind.DECISION: "Decisions",
+    RecordKind.INTENTION: "Intentions",
+    RecordKind.LOOP: "To-dos and promises",
+    RecordKind.LESSON: "Lessons",
+    RecordKind.EPISODE: "Events",
+    RecordKind.CRITERION: "Criteria",
+    RecordKind.WORK_STATE: "Work",
+    RecordKind.ENTITY: "People and things",
 }
 _KIND_ORDER = list(_KIND_TITLE)
 _MONTHS = (
@@ -155,6 +169,7 @@ _LEAD = frozenset(
         "откуда",
         "где-то",
         "forget",
+        "it",
         "about",
         "everything",
         "please",
@@ -187,11 +202,18 @@ _SAID_ABOUT = re.compile(
     r"(?:\s+(?:тебе|вам|you))?\s+",
     re.IGNORECASE,
 )
-# the user's reason after the target is not the target («…, это было нечестно», «…, не
+# The user's reason after the target is not the target («…, это было нечестно», «…, не
 # хочу, чтобы это где-то висело», "…, it was unfair")
+# A reason after the target («…, не хочу сглазить», "…, don't want to jinx it") is not
+# what to forget: cut after a comma or dash. The subject is often dropped in chat ("don't
+# want", "no need"), so the reason words stand on their own.
 _REASON_TAIL = re.compile(
-    r"\s*[,;—–-]+\s*(?:это\s+было|это\s+нечестно|не\s+хочу|не\s+надо|потому\s+что|так\s+как"
-    r"|чтобы|т\.\s?к\.|because|it\s+was|i\s+don'?t\s+want)(?!\w).*$",
+    r"\s*[,;—–-]+\s*(?:это\s+было|это\s+нечестно|не\s+хочу|не\s+хочется|неохота|не\s+надо"
+    r"|не\s+нужно|не\s+стоит|потому\s+что|так\s+как|а\s+то|ибо|чтобы|т\.\s?к\.|because"
+    r"|cause|'cause|cuz|coz|since|so\s+(?:that|i|it|we)|it\s+was|no\s+need"
+    r"|(?:i\s+)?(?:don'?t|do\s+not)\s+(?:want|wanna|need)|(?:я\s+)?ошиб\w*|неточн\w*|неправильн\w*"
+    r"|неправда|я\s+перепутал\w*|i\s+was\s+wrong|i\s+got\s+it\s+wrong|i\s+mixed\s+(?:it|that)\s+up"
+    r"|(?:i\s+was\s+)?mistaken|wrong|turns?\s+out|оказалось)(?!\w).*$",
     re.IGNORECASE | re.DOTALL,
 )
 _BACK_REF = re.compile(
@@ -234,6 +256,14 @@ _FILLER = frozenset(
         "then",
         "please",
         "also",
+        "кстати",
+        "вообще",
+        "блин",
+        "oh",
+        "and",
+        "btw",
+        "anyway",
+        "actually",
     ]
 )
 # words that describe the person, not a topic («всё про моего брата Диму»)
@@ -316,9 +346,109 @@ _FORGET_VERB = re.compile(
 )
 _FOREVER_WORD = re.compile(
     r"(?<!\w)(?:насовсем|навсегда|полностью|совсем|окончательно|начисто|бесследно|подчистую"
-    r"|forever|permanently|completely|for\s+good|entirely)(?!\w)",
+    r"|с\s+концами|без\s+следа|напрочь|forever|for\s+ever|permanently|completely|for\s+good"
+    r"|entirely|once\s+and\s+for\s+all|without\s+a\s+trace|for\s+real)(?!\w)",
     re.IGNORECASE,
 )
+# A cancel said without a cancel verb («отбой», «не надо уже», «неактуально», «можно
+# вычеркнуть», "never mind the dentist", "scrap Friday", "no need to remind me"). Read only
+# once the user's words went to the forget call and carry no plain forget or cancel verb: the
+# safety net and the fenced reads keep the strict lexicon, where «не надо» and "never mind" are
+# ordinary speech ("never mind the playlist, just put on lofi").
+_SAID_CANCEL = re.compile(
+    r"(?<![\w-])(?:отбой"
+    r"|(?:уже\s+)?(?:можно\s+|больше\s+)?не\s+(?:надо|нужно)\s+(?:мне\s+)?напомина\w*"
+    r"|(?:можно\s+|больше\s+)?не\s+напомина\w*"
+    r"|(?:уже\s+)?не\s+(?:надо|нужно|нужн[аоы]|нужен)(?:\s+уже)?"
+    r"|(?:уже\s+)?(?:не\s*актуальн\w*|отменяется|отменяем|отпадает|отпал[аио]?|снимается|снимаем)"
+    r"|(?:можно|надо|нужно)\s+(?:это\s+|её\s+|ее\s+|его\s+|их\s+)?"
+    r"(?:вычеркнуть|отменить|убрать|забыть|снять|удалить)"
+    r"|(?:no\s+need\s+to|don'?t|do\s+not|stop)\s+remind(?:ing)?(?:\s+me)?"
+    r"|never\s*mind(?:\s+about)?|scrap|nix|scratch(?:\s+out)?|drop"
+    r"|no\s+longer\s+(?:needed|happening)|not\s+(?:needed|happening)(?:\s+any\s*more)?"
+    r"|off\s+the\s+table)(?![\w-])",
+    re.IGNORECASE,
+)
+_LATIN_WORD = re.compile(r"[a-z]", re.IGNORECASE)
+
+
+def said_cancel(text: str | None) -> bool:
+    """The user's words, already sent to the forget call, cancel a plan without a plain verb."""
+    body = text or ""
+    if not body or _FORGET_VERB.search(body) or safe_text.order_kind(body) is not None:
+        return False
+    return bool(_SAID_CANCEL.search(body))
+
+
+def _canon_cancel(text: str) -> str:
+    """The said cancel rewritten to the plain verb, the plan it names kept in place
+    («встречу в пятницу не надо уже» → «встречу в пятницу забудь», "scrap Friday" →
+    "forget Friday")."""
+
+    def plain(m: re.Match[str]) -> str:
+        return "forget" if _LATIN_WORD.search(m.group(0)[:3]) else "забудь"
+
+    return _SAID_CANCEL.sub(plain, text, count=1)
+
+
+# A clause that brings the new value after the forget («забудь старый адрес, теперь …»,
+# "forget the bakery, she works at a café now") or asks to keep something else: not the target.
+_NEW_VALUE = re.compile(
+    r"(?<!\w)(?:теперь|сейчас|отныне|нов(?:ый|ая|ое|ые|ую|ого|ой|ом|ых)|запомни\w*|запиши"
+    r"|now|nowadays|instead|these\s+days|new|remember|note)(?!\w)",
+    re.IGNORECASE,
+)
+_CLAUSE_SEP = re.compile(r"\s*(?:[,;]|\s[—–-](?=\s))\s*")
+_SENT_STOP = re.compile(r"[.!?…]+(?=\s)|\n+")
+
+
+def brings_new_value(text: str | None) -> bool:
+    """The user's words bring a value besides the one they drop: a «теперь» / "now" / "instead"
+    clause, or a second day or time («не в субботу — в воскресенье»)."""
+    body = text or ""
+    days = len(_KIND_DAY.findall(body)) + len(_KIND_TIME.findall(body))
+    return bool(_NEW_VALUE.search(body)) or days >= 2
+
+
+def _sentences(text: str) -> list[str]:
+    """`text` cut at sentence ends; a period after a short lower-case word («ул.», «т.к.»)
+    is an abbreviation, not an end."""
+    out: list[str] = []
+    start = 0
+    for m in _SENT_STOP.finditer(text):
+        word = re.search(r"(\w+)$", text[start : m.start()])
+        if m.group(0) == "." and word and len(word.group(1)) <= 3 and word.group(1).islower():
+            continue
+        out.append(text[start : m.end()])
+        start = m.end()
+    out.append(text[start:])
+    return [s.strip() for s in out if s.strip()]
+
+
+def _order_part(target: str) -> str:
+    """The part of the user's message that names what to forget. A longer message carries the
+    order in passing: only its sentence counts (with the one before it when the order points
+    back, «Дима переехал. Забудь его адрес»); a clause after it that brings the new value is cut
+    when the order's own clause already names something."""
+    sents = _sentences(target)
+    hold = [i for i, s in enumerate(sents) if _FORGET_VERB.search(s)]
+    if not hold:
+        return target
+    lo, hi = hold[0], hold[-1]
+    if lo > 0 and _BACK_REF.search(" ".join(sents[lo : hi + 1])):
+        lo -= 1
+    text = " ".join(sents[lo : hi + 1])
+    clauses = _CLAUSE_SEP.split(text)
+    at = next((i for i, c in enumerate(clauses) if _FORGET_VERB.search(c)), None)
+    if at is None or len(clauses) < 2:
+        return text
+    own = _content_words(_FORGET_VERB.sub(" ", _FOREVER_WORD.sub(" ", clauses[at])))
+    if not own:
+        return text
+    kept = [c for i, c in enumerate(clauses) if i <= at or not _NEW_VALUE.search(c)]
+    return ", ".join(kept)
+
+
 # Grammar words that carry no topic (kept out of the lexical match).
 _STOP = frozenset(
     [
@@ -444,6 +574,32 @@ _STOP = frozenset(
 _WORD = re.compile(r"[0-9a-zа-яё][0-9a-zа-яё'\-]*", re.IGNORECASE)
 _HANDLE = re.compile(r"m:([^\s,;»«\]\)\(\[]+)")
 _SELF = frozenset({"меня", "мне", "я", "мной", "себя", "себе", "me", "myself", "i"})
+# Words that widen «что ты обо мне помнишь» without naming a topic («что ты про меня уже
+# знаешь», "what do you know about me so far"): the question still covers the whole user.
+_SELF_FILLER = frozenset(
+    {
+        "уже",
+        "вообще",
+        "пока",
+        "сейчас",
+        "ещё",
+        "еще",
+        "сам",
+        "сама",
+        "самого",
+        "самой",
+        "so",
+        "far",
+        "yet",
+        "already",
+        "now",
+        "ever",
+        "all",
+        "anything",
+        "stuff",
+        "things",
+    }
+)
 
 
 # ---------------------------------------------------------------- small words
@@ -460,6 +616,37 @@ def ru_date(ts: str | None) -> str | None:
     if not 1 <= m <= 12:
         return None
     return f"{d} {_MONTHS[m - 1]} {y}"
+
+
+_MONTHS_EN = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)  # fmt: skip
+
+
+def en_date(ts: str | None) -> str | None:
+    """ "October 12, 2026" from an ISO date or timestamp."""
+    ru = ru_date(ts)
+    if ru is None or not ts:
+        return None
+    y, m, d = int(ts[0:4]), int(ts[5:7]), int(ts[8:10])
+    return f"{_MONTHS_EN[m - 1]} {d}, {y}"
+
+
+def day_words(ts: str | None, *, en: bool = False) -> str | None:
+    return en_date(ts) if en else ru_date(ts)
+
+
+_CYR = re.compile(r"[а-яё]", re.IGNORECASE)
+_LAT = re.compile(r"[a-z]", re.IGNORECASE)
+
+
+def is_english(text: str | None) -> bool:
+    """The user's words are English: Latin letters and next to no Cyrillic ones (a Russian question
+    with an English name stays Russian)."""
+    t = text or ""
+    lat, cyr = len(_LAT.findall(t)), len(_CYR.findall(t))
+    return lat >= 3 and lat > 4 * cyr
 
 
 def _plural(n: int, one: str, few: str, many: str) -> str:
@@ -614,9 +801,11 @@ def _names(conn: sqlite3.Connection, ids: Iterable[str | None]) -> dict[str, str
     }
 
 
-def _who(rec: AnyRecord, names: dict[str, str], *, claim: bool = False) -> str:
-    """Who said it, in words: «ты сам», «по словам Димы», «вывод Куба»."""
+def _who(rec: AnyRecord, names: dict[str, str], *, claim: bool = False, en: bool = False) -> str:
+    """Who said it, in words: «ты сам», «по словам Димы», «вывод Куба» (`en`: in English)."""
     tier = AuthorTier(rec.author_tier)
+    if en:
+        return _who_en(tier, names.get(_speaker(rec) or ""), claim=claim)
     if tier is AuthorTier.USER:
         return "по твоим словам" if claim else "ты сам"
     if tier is AuthorTier.USER_CONFIRMED:
@@ -631,6 +820,20 @@ def _who(rec: AnyRecord, names: dict[str, str], *, claim: bool = False) -> str:
     return "вывод Куба"
 
 
+def _who_en(tier: AuthorTier, name: str | None, *, claim: bool = False) -> str:
+    if tier is AuthorTier.USER:
+        return "per your own words" if claim else "you told me"
+    if tier is AuthorTier.USER_CONFIRMED:
+        return "per your own words" if claim else "you confirmed it"
+    if tier is AuthorTier.USER_ROOM:
+        return "you said it aloud, in the room"
+    if tier is AuthorTier.OTHER:
+        return f"per {name}" if name else "per someone else"
+    if tier is AuthorTier.TOOL:
+        return "from a tool or a page"
+    return "the Cube's inference"
+
+
 def _date(rec: AnyRecord) -> str | None:
     return rec.recorded_at[:10] if rec.recorded_at else None
 
@@ -638,7 +841,9 @@ def _date(rec: AnyRecord) -> str | None:
 def _item(rec: AnyRecord, names: dict[str, str], use: policy.Use | None = None) -> Item:
     from .api import Item
 
-    text = _english(rec)
+    # What goes out passes the shared cleaner (an order to forget is cut, foreign
+    # quarantined spans too), as the basket and the MCP lines do
+    text = safe_text.clean(_english(rec), tier=AuthorTier(rec.author_tier))
     if use is not None and use.hold:
         text = f"{text} ({policy.HOLD_LINE})"
     tier = AuthorTier(rec.author_tier)
@@ -880,6 +1085,75 @@ def _find(
     return found
 
 
+# A correction's value kind: a day (date, «10-го», "the 13th", a weekday), a time
+_KIND_DAY = re.compile(
+    r"(?<![\d:])\d{1,2}(?:-?го|-?е|st|nd|rd|th)(?!\w)|\b(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\b"
+    r"|\b(?:today|tomorrow|tonight|weekend)\b|понедельник|вторник|сред[уаы]|четверг|пятниц"
+    r"|суббот|воскресень|сегодня|завтра|послезавтра|выходны",
+    re.IGNORECASE,
+)
+_KIND_TIME = re.compile(
+    r"(?<!\d)\d{1,2}[:.]\d{2}(?!\d)|\b\d{1,2}\s*(?:am|pm|a\.m\.|p\.m\.)|\bat\s+\d{1,2}\b"
+    r"|\bnoon\b|\bmidnight\b|\bв\s+\d{1,2}(?:\s*час)",
+    re.IGNORECASE,
+)
+
+
+def value_kinds(*texts: str | None) -> set[str]:
+    """The kinds of value these words hold: 'day' and/or 'time'."""
+    out: set[str] = set()
+    for t in texts:
+        if not t:
+            continue
+        if _KIND_DAY.search(t) or any(x.startswith("date:") for x in ledger.value_tokens(t)):
+            out.add("day")
+        if _KIND_TIME.search(t):
+            out.add("time")
+    return out
+
+
+def find_by_value_kind(
+    conn: sqlite3.Connection, phrase: str, *, thread_id: str | None = None
+) -> list[str]:
+    """A correction whose words name no record («нет, в среду», "actually it's next Tuesday",
+    "it got pushed to 10/14"): the user's own usable facts it may correct, by subject and
+    value kind. The subject is the person their words name; with none, only the records
+    served in this thread (never just the user's newest ones: a stray «сегодня» is no
+    target). A candidate holds a value of the kind the new value has. Newest first; empty
+    when their words carry no day or time."""
+    kinds = value_kinds(hot.shifted(phrase) or phrase)
+    if not kinds:
+        return []
+    named, _rest = _named(conn, _strip_lead(phrase))
+    if named:
+        ids = _about(conn, [e.entity_id for e in named])
+    else:
+        ids = [
+            r[0]
+            for r in conn.execute(
+                "SELECT item_id FROM served WHERE thread_id = ? ORDER BY id DESC LIMIT 60",
+                (thread_id or "",),
+            )
+        ]
+    recs = _records(conn, list(dict.fromkeys(ids)))
+    out: list[tuple[str, str]] = []
+    for rid, rec in recs.items():
+        if rec.kind is not RecordKind.FACT or not _usable(rec):
+            continue
+        if AuthorTier(rec.author_tier) not in ledger.USER_TIERS:
+            continue  # never someone else's claim
+        held = value_kinds(
+            getattr(rec, "value_text", None),
+            getattr(rec, "quote_orig", None),
+            _english(rec),
+            getattr(rec, "valid_from", None),
+            getattr(rec, "valid_to", None),
+        )
+        if kinds & held:
+            out.append((str(rec.recorded_at or ""), rid))
+    return [rid for _ts, rid in sorted(out, reverse=True)]
+
+
 def _self_ids(conn: sqlite3.Connection) -> list[str]:
     """Records about the user («что ты помнишь про меня»): subjects 'user'/'self'/'owner'."""
     return [
@@ -909,6 +1183,8 @@ class _What:
     hidden: int = 0
     uses: dict[str, policy.Use] = field(default_factory=dict)
     names: dict[str, str] = field(default_factory=dict)
+    status: list[str] = field(default_factory=list)  # forgotten / retracted / review
+    en: bool = False  # the user's question is English: so are the lines
 
 
 def _single(conn: sqlite3.Connection, relations: Iterable[str]) -> set[str]:
@@ -947,15 +1223,19 @@ def _order(recs: list[AnyRecord]) -> list[AnyRecord]:
 
 
 def _what(conn: sqlite3.Connection, about: str, turn: TurnCtx) -> _What:
-    out = _What(about=_strip_lead(about) or about.strip())
+    out = _What(about=_strip_lead(about) or about.strip(), en=is_english(about))
     groups: list[tuple[str, str | None, list[str]]] = []
+    found: _Found | None = None
     explicit = handles_in(about)
     if explicit:
         groups.append((out.about, None, explicit))
-    elif set(_words(out.about)) & _SELF and len(_content_words(out.about)) == 0:
+    elif set(_words(out.about)) & _SELF and not [
+        w for w in _content_words(out.about) if w not in _SELF_FILLER and w not in _SELF
+    ]:
         groups.append(("тебя", None, _self_ids(conn)))
     else:
-        found = _find(conn, about, min_cover=0.0)
+        # «откуда ты знаешь, что …», "who told me about …": the frame is not the topic
+        found = _find(conn, _ask_core(about) or about, min_cover=0.0, include_history=True)
         if found.terms:
             groups.append((found.query, None, [rid for _s, rid in found.scored]))
         else:
@@ -964,6 +1244,16 @@ def _what(conn: sqlite3.Connection, about: str, turn: TurnCtx) -> _What:
     recs = _records(conn, [rid for _t, _e, ids in groups for rid in ids])
     usable = {rid: r for rid, r in recs.items() if _usable(r) and r.kind is not RecordKind.ENTITY}
     out.uses = policy.decide_many(conn, list(usable), turn) if usable else {}
+    if groups and groups[0][0] == "тебя" and not explicit:
+        # §5.5: the user's own items are used wherever they apply, and «что ты обо мне помнишь» is
+        # about the whole user, so each of the user's own items applies (with its «учёл» note).
+        # Other people's sensitive claims about the user still need a direct question.
+        for rid, use in out.uses.items():
+            if not use.allowed and use.reason == "own_not_applicable":
+                quote = getattr(usable[rid], "origin_quote", None) or getattr(
+                    usable[rid], "quote_orig", None
+                )
+                out.uses[rid] = policy.Use(True, "own_applies", policy.note_for(quote))
     names_wanted: list[str | None] = []
     for title, eid, ids in groups:
         allowed = [usable[i] for i in ids if i in usable and out.uses[i].allowed]
@@ -972,6 +1262,7 @@ def _what(conn: sqlite3.Connection, about: str, turn: TurnCtx) -> _What:
         out.groups.append(_Group(title, eid, _order(plain), _order(rival)))
         names_wanted += [_speaker(r) for r in allowed]
     out.names = _names(conn, names_wanted)
+    out.status = _status_lines(conn, about, found, out, usable)
     return out
 
 
@@ -990,57 +1281,89 @@ def what_answer(conn: sqlite3.Connection, about: str, turn: TurnCtx) -> WhatAnsw
     )
 
 
-def _line(rec: AnyRecord, names: dict[str, str], use: policy.Use | None) -> str:
+def _line(
+    rec: AnyRecord, names: dict[str, str], use: policy.Use | None, *, en: bool = False
+) -> str:
     text = _q(_shown(rec))
     if rec.kind is RecordKind.IMPRESSION:
-        text = f"впечатление: {text}"
+        text = f"{'impression' if en else 'впечатление'}: {text}"
     elif getattr(rec, "fkind", None) is FKind.PLAN:
-        text = f"план: {text}"
-    when = ru_date(rec.recorded_at)
-    tail = ", ".join(x for x in (_who(rec, names), when) if x)
+        text = f"{'plan' if en else 'план'}: {text}"
+    when = day_words(rec.recorded_at, en=en)
+    tail = ", ".join(x for x in (_who(rec, names, en=en), when) if x)
     marks = []
     if rec.status is Status.ARCHIVED:
-        marks.append("в архиве")
+        marks.append("archived" if en else "в архиве")
+    if rec.status is Status.NEEDS_REVIEW:
+        marks.append("under review" if en else "на проверке")
     if rec.review:
-        marks.append("надо перепроверить")
+        marks.append("needs a re-check" if en else "надо перепроверить")
     if use is not None and use.hold:
-        marks.append("не отправлять без твоего слова")
+        marks.append("not to be sent without your word" if en else "не отправлять без твоего слова")
     mark = f" ({'; '.join(marks)})" if marks else ""
     return f"— {text} — {tail}{mark} [{handle(rec.id)}]"
 
 
-def _claim_line(rec: AnyRecord, names: dict[str, str]) -> str:
-    when = ru_date(rec.recorded_at)
+def _claim_line(rec: AnyRecord, names: dict[str, str], *, en: bool = False) -> str:
+    when = day_words(rec.recorded_at, en=en)
     tail = f", {when}" if when else ""
-    return f"— {_who(rec, names, claim=True)}: {_q(_shown(rec))}{tail} [{handle(rec.id)}]"
+    who = _who(rec, names, claim=True, en=en)
+    return f"— {who}: {_q(_shown(rec))}{tail} [{handle(rec.id)}]"
 
 
 def render_what(w: _What) -> list[str]:
+    en = w.en
     lines: list[str] = []
     for g in w.groups:
         if not g.items and not g.competing:
             continue
-        title = "тебя" if g.title == "тебя" else f"«{g.title}»"
+        if en:
+            title = "you" if g.title == "тебя" else f"«{g.title}»"
+        else:
+            title = "тебя" if g.title == "тебя" else f"«{g.title}»"
         tag = f" [{handle(g.entity_id)}]" if g.entity_id and len(w.groups) > 1 else ""
-        lines.append(f"Про {title}{tag} помню:")
+        lines.append(f"About {title}{tag} I remember:" if en else f"Про {title}{tag} помню:")
         kind = None
         for r in g.items:
             if r.kind is not kind:
                 kind = r.kind
-                lines.append(f"{_KIND_TITLE.get(kind, kind.value)}:")
-            lines.append(_line(r, w.names, w.uses.get(r.id)))
+                titles = _KIND_TITLE_EN if en else _KIND_TITLE
+                lines.append(f"{titles.get(kind, kind.value)}:")
+            lines.append(_line(r, w.names, w.uses.get(r.id), en=en))
         if g.competing:
-            lines.append("Расходится — разные люди говорят разное:")
-            lines += [_claim_line(r, w.names) for r in g.competing]
+            lines.append(
+                "Conflicting — different people say different things:"
+                if en
+                else "Расходится — разные люди говорят разное:"
+            )
+            lines += [_claim_line(r, w.names, en=en) for r in g.competing]
     if w.hidden:
         n = w.hidden
         lines.append(
-            f"Ещё {n} {_plural(n, 'запись', 'записи', 'записей')} на личные темы — "
+            f"{n} more {'item' if n == 1 else 'items'} on private topics — I'll tell you if you"
+            " ask about them directly."
+            if en
+            else f"Ещё {n} {_plural(n, 'запись', 'записи', 'записей')} на личные темы — "
             "скажу, если спросишь о них прямо."
         )
     if not lines:
-        return [f"Про «{w.about}» ничего не помню."]
-    return lines
+        about = _echo(w.about)
+        lines = [
+            f"I remember nothing about «{about}»." if en else f"Про «{about}» ничего не помню."
+        ]
+    return lines + w.status
+
+
+def _echo(about: str) -> str:
+    """The user's words echoed back in «ничего не помню»: a side the user's own «не X, а Y»
+    retires is named only as history there (as the raw lane shows it), never as a current
+    value; when it cannot be located the words are not echoed at all."""
+    from .recall import basket
+
+    sides = [x for x in ledger.retired_sides(about) if basket._value_like(x)]
+    if not sides:
+        return about
+    return basket._cut_sides(about, list(dict.fromkeys(sides))) or "это"
 
 
 def what_view(conn: sqlite3.Connection, about: str, turn: TurnCtx) -> _What:
@@ -1057,6 +1380,294 @@ def what_ids(w: _What) -> list[str]:
 def what(conn: sqlite3.Connection, about: str, turn: TurnCtx) -> list[str]:
     """«что ты помнишь про X» (§17) in plain Russian lines with handles."""
     return render_what(what_view(conn, about, turn))
+
+
+# ---------------------------------------------------------------- inspect: frames and status lines
+# «откуда ты знаешь, что …» / "who told me about …" name a topic inside a frame; the
+# frame's words are not the topic. «что с забытым», «исправь …» want a status, not only items:
+# what is in the trash or purged, what the user already forgot or retracted, what goes to review.
+
+_SOURCE_Q = re.compile(
+    r"(?<!\w)(?:откуда|от\s+кого|кто\s+(?:\w+\s+){0,2}(?:сказал|рассказал|написал|говорил|сообщил"
+    r"|слышал)\w*|где\s+(?:\w+\s+){0,2}(?:услышал|слышал|прочитал|прочёл|прочел|взял|узнал)\w*"
+    r"|источник\w*|where(?:'d|'s)?|who\s+(?:\w+\s+)?(?:told|said|says|mentioned|wrote)"
+    r"|how\s+(?:do|did|would|does)\s+(?:you|u)\s+know|sources?)(?!\w)",
+    re.IGNORECASE,
+)
+_FRAME = frozenset(
+    [
+        "откуда",
+        "кто",
+        "кого",
+        "от",
+        "тебе",
+        "мне",
+        "ты",
+        "это",
+        "этом",
+        "этого",
+        "знаешь",
+        "знал",
+        "знала",
+        "узнал",
+        "узнала",
+        "узнали",
+        "сказал",
+        "сказала",
+        "сказали",
+        "рассказал",
+        "рассказала",
+        "рассказали",
+        "написал",
+        "написала",
+        "написали",
+        "говорил",
+        "говорила",
+        "говорили",
+        "сообщил",
+        "сообщила",
+        "слышал",
+        "слышала",
+        "услышал",
+        "услышала",
+        "прочитал",
+        "прочитала",
+        "взял",
+        "взяла",
+        "где",
+        "информация",
+        "инфа",
+        "источник",
+        "источника",
+        "что",
+        "про",
+        "о",
+        "об",
+        "вообще",
+        "такое",
+        "where",
+        "where's",
+        "where'd",
+        "wheres",
+        "who",
+        "whom",
+        "told",
+        "tell",
+        "said",
+        "say",
+        "says",
+        "mentioned",
+        "wrote",
+        "hear",
+        "heard",
+        "get",
+        "got",
+        "learn",
+        "learned",
+        "learnt",
+        "read",
+        "find",
+        "found",
+        "did",
+        "do",
+        "does",
+        "how",
+        "know",
+        "knew",
+        "source",
+        "sources",
+        "info",
+        "information",
+        "from",
+        "thing",
+        "stuff",
+        "me",
+        "you",
+        "that",
+        "this",
+        "about",
+        "the",
+        "on",
+        "for",
+        "of",
+        "is",
+        "was",
+        "it",
+    ]
+)
+# a question about what the user had forgotten («что с забытым», "is it fully deleted now?");
+# an order to forget («забудь …», "forget …", "delete …") is not one
+_FORGOT_Q = re.compile(
+    r"(?<!\w)(?:забыт\w*|забыл\w*|забыва\w*|удал[её]н\w*|удалил\w*|стёр\w*|стер\w*|корзин\w*"
+    r"|forgot\w*|deleted|deleting|deletion|purg\w*|erased|wiped|trash\w*"
+    r"|(?:просил\w*|велел\w*)\s+(?:тебя\s+)?(?:забыть|удалить|стереть)"
+    r"|(?:asked|told|wanted)\s+(?:you\s+)?to\s+(?:forget|delete|erase|remove))(?!\w)",
+    re.IGNORECASE,
+)
+_FIX_Q = re.compile(
+    r"(?<!\w)(?:исправ\w*|поправ\w*|неправильн\w*|ошиб\w*|fix\w*|correct\w*|wrong|mistaken)(?!\w)",
+    re.IGNORECASE,
+)
+_ORDERS_SHOWN = 5
+
+
+def _ask_core(about: str) -> str:
+    """The topic inside a where-from frame («кто сказал, что Нина уходит» → «Нина уходит»)."""
+    if not _SOURCE_Q.search(about or ""):
+        return about
+    kept = [
+        w for w in re.split(r"\s+", about) if _norm(w.strip(",.!?:;«»\"'()")) not in _FRAME and w
+    ]
+    return " ".join(kept)
+
+
+def _forget_orders(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """The user's forget orders, newest first: id, stage state, record count, the day it was said."""
+    import json
+
+    out: list[dict[str, Any]] = []
+    for payload, created in conn.execute(
+        "SELECT payload, created_at FROM jobs WHERE jkind = ?"
+        " ORDER BY created_at DESC, id DESC LIMIT 20",
+        (forget.PURGE_JOB,),
+    ):
+        try:
+            body = json.loads(payload)
+            fid = str(body["forget_id"])
+            state = forget.status(conn, fid)
+        except (ValueError, KeyError, forget.ForgetError):
+            continue
+        n = len([r for r in body.get("record_ids") or [] if r])
+        out.append({"id": fid, "state": state, "n": n, "at": body.get("stopped_at") or created})
+    return out
+
+
+def _order_line(o: dict[str, Any], *, en: bool) -> str:
+    """One forget order's status; never its words (an order to forget is not memory)."""
+    when = day_words(o["at"], en=en) or ""
+    n = o["n"]
+    if en:
+        what = f" ({n} {'item' if n == 1 else 'items'})" if n else ""
+        head = f"Forgotten at your request{' on ' + when if when else ''}{what}"
+        return {
+            "in_trash": f"{head}: in the trash — not used; fully deleted after {TRASH_HOURS} h;"
+            " you can restore it.",
+            "purging": f"{head}: in the trash — not used; deleting it fully, not finished yet.",
+            "purged": f"{head}: fully deleted — it can't be brought back.",
+            "undone": f"The forget{' of ' + when if when else ''} was undone: brought back,"
+            " in use again.",
+        }[o["state"]]
+    what = f" ({n} {_plural(n, 'запись', 'записи', 'записей')})" if n else ""
+    head = f"Забыто по твоей просьбе{' ' + when if when else ''}{what}"
+    return {
+        "in_trash": f"{head}: в корзине — не использую, удалю полностью через {TRASH_HOURS} ч;"
+        " можно «Вернуть».",
+        "purging": f"{head}: в корзине — не использую, удаляю полностью, ещё не закончил.",
+        "purged": f"{head}: удалил полностью, восстановить нельзя.",
+        "undone": f"Забывание{' от ' + when if when else ''} отменено: вернул, снова использую.",
+    }[o["state"]]
+
+
+def _forgotten_cover(conn: sqlite3.Connection, o: dict[str, Any], terms: Sequence[str]) -> int:
+    """How many of the user's topic words the records of a forget order had (their trash copy)."""
+    if o["state"] not in ("in_trash", "purging") or not terms:
+        return 0
+    words: set[str] = set()
+    for ws in _trashed_words(conn, o["id"]).values():
+        words |= ws
+    return _covered(terms, words)
+
+
+def forget_order_line(conn: sqlite3.Connection, forget_id: str, *, en: bool = False) -> str | None:
+    """The status line of one forget order (MCP `forget` output): in the trash / purging /
+    purged / undone; None when there is no such order."""
+    o = next((o for o in _forget_orders(conn) if o["id"] == forget_id), None)
+    return _order_line(o, en=en) if o is not None else None
+
+
+def target_status(conn: sqlite3.Connection, text: str, turn: TurnCtx) -> list[str]:
+    """«уже забыто» / «уже отменено» for what `text` names (MCP `fix` / `forget` when nothing
+    usable was changed). Serves nothing; no forgotten or retired value is in the lines."""
+    w = _what(conn, text, turn)
+    marks = ("уже забыто", "уже отменено", "already forgotten", "already retracted")
+    return [x for x in w.status if any(m in x for m in marks)]
+
+
+def _dependents_of(conn: sqlite3.Connection, rid: str) -> int:
+    row = conn.execute(
+        "SELECT count(DISTINCT j.target_record_id) FROM justifications j JOIN records r"
+        " ON r.id = j.target_record_id WHERE j.member_record_id = ? AND j.target_record_id != ?"
+        " AND r.status IN ('active', 'needs_review')",
+        (rid, rid),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _status_lines(
+    conn: sqlite3.Connection,
+    about: str,
+    found: _Found | None,
+    w: _What,
+    usable: dict[str, AnyRecord],
+) -> list[str]:
+    """Status lines under «что ты помнишь», none of them with a forgotten or retired value:
+    the forget orders when the user asks about the forgotten; «уже забыто» / «уже отменено»
+    when what the user names is in the trash or retracted (and no usable record names it
+    better); for a fix, how many items rest on what would be corrected (they go to review)."""
+    en = w.en
+    lines: list[str] = []
+    terms = list(found.terms) if found is not None else []
+    shown = [r for g in w.groups for r in (*g.items, *g.competing)]
+    best = max((_covered(terms, _record_words(r)) for r in shown), default=0)
+    orders = _forget_orders(conn) if (terms or _FORGOT_Q.search(about or "")) else []
+    named = [o for o in orders if _forgotten_cover(conn, o, terms) >= max(1, best)]
+    for o in named[:_ORDERS_SHOWN]:
+        when = day_words(o["at"], en=en)
+        tail = (
+            (
+                "; it is in the trash, you can restore it"
+                if en
+                else "; оно в корзине, можно «Вернуть»"
+            )
+            if o["state"] == "in_trash"
+            else ""
+        )
+        if en:
+            lines.append(f"That is already forgotten at your request{' on ' + when if when else ''}"
+                         f" — not used{tail}.")  # fmt: skip
+        else:
+            lines.append(f"Это уже забыто по твоей просьбе{' ' + when if when else ''}"
+                         f" — не использую{tail}.")  # fmt: skip
+    if _FORGOT_Q.search(about or "") and not named:
+        lines += [_order_line(o, en=en) for o in orders[:_ORDERS_SHOWN]]
+    if found is not None and terms:
+        gone = [
+            r
+            for _s, rid in found.scored
+            if (r := found.recs.get(rid)) is not None and r.status is Status.RETRACTED
+        ]
+        gone = [r for r in gone if _covered(terms, _record_words(r)) >= max(1, best)]
+        for r in gone[:2]:
+            lines.append(
+                f"That one is already retracted: you said it isn't true — not used [{handle(r.id)}]."
+                if en
+                else f"Это уже отменено: ты сказал, что это неправда, — не использую [{handle(r.id)}]."
+            )
+    if _FIX_Q.search(about or ""):
+        for r in [r for r in shown if r.id in usable][:5]:
+            n = _dependents_of(conn, r.id)
+            if not n:
+                continue
+            short = _q(_clip(_shown(r), 50))
+            lines.append(
+                f"{n} {'item rests' if n == 1 else 'items rest'} on {short} — a fix sends"
+                f" {'it' if n == 1 else 'them'} to review [{handle(r.id)}]."
+                if en
+                else f"На {short} {_plural(n, 'держится', 'держатся', 'держится')} {n}"
+                f" {_plural(n, 'запись', 'записи', 'записей')} — после правки отправлю"
+                f" {'её' if n == 1 else 'их'} на проверку [{handle(r.id)}]."
+            )
+    return lines
 
 
 # ---------------------------------------------------------------- get / search (§10.4)
@@ -1116,15 +1727,39 @@ _STATUS_LINE = {
     Status.RETRACTED: "Сейчас не используется: ты сказал, что это неправда.",
     Status.NEEDS_REVIEW: "Сейчас не используется: опора под этим пропала, жду проверки.",
 }
+_STATUS_LINE_EN = {
+    Status.SUPERSEDED: "Not in use now: replaced by a newer one.",
+    Status.RETRACTED: "Not in use now: you said it isn't true.",
+    Status.NEEDS_REVIEW: "Not in use now: what it rested on is gone; waiting for a check.",
+}
+_SOURCES_EN: dict[str, str] = {
+    "разговор с Кубом": "conversation with the Cube",
+    "голосом": "said aloud",
+    "голосом в комнате": "said aloud in the room",
+    "Telegram-бот": "Telegram bot",
+    "письмо": "email",
+    "файл": "file",
+    "страница в интернете": "web page",
+    "экран": "screen",
+    "инструмент": "tool",
+    "старые заметки": "old notes",
+    "неизвестно откуда": "unknown source",
+}
+# the user's own lane, as the eval and the importers name it
+_OWN_SOURCES = frozenset({"owner", "user", "user_msg", "owner_msg", "me", "self"})
 
 
-def _source_words(kind: str | None, chat_id: str | None) -> str:
+def _source_words(kind: str | None, chat_id: str | None, *, en: bool = False) -> str:
     k = (kind or "").casefold()
     if k in _SOURCES:
-        return _SOURCES[k]
-    if (chat_id or "").startswith("tg:"):
-        return "Telegram"
-    return k or "неизвестно откуда"
+        ru = _SOURCES[k]
+    elif k in _OWN_SOURCES:
+        ru = _SOURCES["owner_message"]
+    elif (chat_id or "").startswith("tg:"):
+        ru = "Telegram"
+    else:
+        ru = k or "неизвестно откуда"
+    return _SOURCES_EN.get(ru, ru) if en else ru
 
 
 def _raw_rows(conn: sqlite3.Connection, ids: Iterable[str]) -> list[sqlite3.Row]:
@@ -1139,45 +1774,128 @@ def _raw_rows(conn: sqlite3.Connection, ids: Iterable[str]) -> list[sqlite3.Row]
     ).fetchall()
 
 
-def _raw_line(row: sqlite3.Row, names: dict[str, str]) -> str:
-    src = _source_words(row["source_kind"], row["chat_id"])
+def _raw_line(
+    row: sqlite3.Row, names: dict[str, str], *, en: bool = False, speaker: str | None = None
+) -> str:
+    """Channel, chat, sender (the resolved name) and the original message's date."""
+    src = _source_words(row["source_kind"], row["chat_id"], en=en)
     chat = row["chat_id"]
-    where = src
-    if chat and chat != "cube" and src != "разговор с Кубом":
-        where = f"{src}, чат {chat}"
     tier = AuthorTier(row["author_tier"])
+    sender = names.get(row["author_entity_id"] or "") or speaker
+    where = src
+    own_lane = src in (_SOURCES["owner_message"], _SOURCES_EN[_SOURCES["owner_message"]])
+    if chat and chat != "cube" and not own_lane:
+        if tier is AuthorTier.OTHER and sender and chat.startswith("tg:"):
+            where = (
+                f"{src}, {'chat with' if en else 'чат с'} {sender}" if en else f"{src}, личный чат"
+            )
+        else:
+            where = f"{src}, {'chat' if en else 'чат'} {chat}"
     if tier in _USER_TIERS:
-        who = "ты сам"
+        who = "you yourself" if en else "ты сам"
     elif tier is AuthorTier.OTHER:
-        who = names.get(row["author_entity_id"] or "") or "другой человек"
+        who = sender or ("someone else" if en else "другой человек")
     elif tier is AuthorTier.USER_ROOM:
-        who = "ты вслух, в комнате"
+        who = "you, aloud in the room" if en else "ты вслух, в комнате"
+    elif tier is AuthorTier.TOOL:
+        who = "a tool or a page" if en else "инструмент или страница"
     else:
-        who = "инструмент или страница" if tier is AuthorTier.TOOL else "Куб"
-    when = ru_date(row["ts"])
+        who = "the Cube" if en else "Куб"
+    when = day_words(row["ts"], en=en)
     hhmm = row["ts"][11:16] if row["ts"] and len(row["ts"]) >= 16 else ""
     stamp = f"{when}, {hhmm}" if when and hhmm else (when or "")
-    gone = " (сообщение уже забыто)" if row["status"] != "active" else ""
+    if row["status"] != "active":
+        gone = " (the message itself is forgotten now)" if en else " (сообщение уже забыто)"
+    else:
+        gone = ""
+    if en:
+        return f"From: {where} · sent by: {who}{', ' + stamp if stamp else ''}{gone}"
     return f"Откуда: {where} · написал: {who}{', ' + stamp if stamp else ''}{gone}"
+
+
+def _shown_to_thread(conn: sqlite3.Connection, rid: str, turn: TurnCtx) -> bool:
+    """The item went out to this thread on an earlier turn: «откуда это» points at it."""
+    if not turn.thread_id:
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM served WHERE thread_id = ? AND item_id = ? AND (turn_id IS NULL OR"
+        " turn_id != ?) AND via IN ('core', 'basket', 'tool') LIMIT 1",
+        (turn.thread_id, rid, turn.turn_id or ""),
+    ).fetchone()
+    return row is not None
+
+
+def _subject_words(conn: sqlite3.Connection, rec: AnyRecord) -> set[str]:
+    """The record's own words plus its people's names and its source message's words."""
+    words = _record_words(rec)
+    ids = [getattr(rec, "subject_id", None), getattr(rec, "object_id", None), _speaker(rec)]
+    for name in _names(conn, ids).values():
+        words |= set(_words(name))
+    raw_id = getattr(rec, "source_raw_id", None)
+    if raw_id:
+        row = conn.execute(
+            "SELECT text FROM raw_chunks WHERE id = ? AND status = 'active'", (raw_id,)
+        ).fetchone()
+        if row and row[0]:
+            words |= set(_words(row[0]))
+    return words
+
+
+def _off_topic(conn: sqlite3.Connection, rec: AnyRecord, turn: TurnCtx) -> bool:
+    """The user's question names a topic and the item shares none of its words: its source is not
+    the answer («нет источника», never an earlier item's lineage). «откуда это» names none."""
+    words = turn.owner_words or ""
+    if not words or rec.id in handles_in(words) or not _SOURCE_Q.search(words):
+        return False
+    terms = _content_words(_ask_core(words))
+    if not terms:
+        return False
+    have = _subject_words(conn, rec)
+    # a Russian question about an English record (or the other way round) cannot be judged
+    # by shared words: never «нет источника» on a language mismatch
+    if not any(bool(_CYR.search(t)) == bool(_CYR.search(w)) for t in terms for w in have):
+        return False
+    return _covered(terms, have) == 0
 
 
 def lineage(conn: sqlite3.Connection, item_id: str, turn: TurnCtx) -> Lineage:
     """`api.where_from`: lineage in plain words - quote, chat, date, who said it."""
     from .api import Lineage
 
+    en = is_english(turn.owner_words)
     rid = (handles_in(item_id) or [item_id.strip()])[0]
     rec = ledger.get_record(conn, rid)
     if rec is None:
-        return Lineage(item_id=rid, lines=["Такой записи нет."])
+        return Lineage(item_id=rid, lines=["No such item." if en else "Такой записи нет."])
     if rec.status in (Status.FORGOTTEN, Status.PURGED):
-        return Lineage(item_id=rid, lines=["Это забыто — откуда оно, больше не показываю."])
+        line = (
+            "That is forgotten — I no longer show where it came from."
+            if en
+            else "Это забыто — откуда оно, больше не показываю."
+        )
+        return Lineage(item_id=rid, lines=[line])
     # a retired record keeps the use-now fence
     use = (policy.decide if rec.status in USABLE else policy.decide_retired)(conn, rid, turn)
-    if not use.allowed:
-        return Lineage(
-            item_id=rid,
-            lines=["Это запись на личную тему — скажу, откуда она, если спросишь о ней прямо."],
+    if not use.allowed and not (
+        # «откуда это» about an item this thread was just shown, or about the user's own words
+        # (only the «not asked directly» fences; a held or foreign-turn fence stays)
+        use.reason == "own_not_applicable"
+        or (use.reason in ("not_asked", "name_only") and _shown_to_thread(conn, rid, turn))
+    ):
+        line = (
+            "That item is on a private topic — I'll say where it came from if you ask about it"
+            " directly."
+            if en
+            else "Это запись на личную тему — скажу, откуда она, если спросишь о ней прямо."
         )
+        return Lineage(item_id=rid, lines=[line])
+    if _off_topic(conn, rec, turn):
+        line = (
+            "No source: I have nothing on that."
+            if en
+            else "Нет источника: про это у меня ничего нет."
+        )
+        return Lineage(item_id=rid, lines=[line])
 
     raws = [getattr(rec, "source_raw_id", None)]
     parents: list[str] = []
@@ -1212,41 +1930,64 @@ def lineage(conn: sqlite3.Connection, item_id: str, turn: TurnCtx) -> Lineage:
         [_speaker(rec), *(r["author_entity_id"] for r in raw_rows)]
         + [_speaker(o) for o in shown_others.values()],
     )
+    speaker = names.get(_speaker(rec) or "")
 
     lines = [f"{_q(_shown(rec))} [{handle(rid)}]"]
-    when = ru_date(rec.recorded_at)
-    lines.append(f"Кто сказал: {_who(rec, names)}" + (f" · записано {when}" if when else ""))
+    when = day_words(rec.recorded_at, en=en)
+    if en:
+        lines.append(
+            f"Who said it: {_who(rec, names, en=True)}" + (f" · recorded {when}" if when else "")
+        )
+    else:
+        lines.append(f"Кто сказал: {_who(rec, names)}" + (f" · записано {when}" if when else ""))
     quote = getattr(rec, "quote_orig", None) or rec.origin_quote
+    label = "Quote" if en else "Цитата"
     if quote and quote.strip() != _shown(rec).strip():
-        lines.append(f"Цитата: {_q(quote)}")
+        lines.append(f"{label}: {_q(quote)}")
     elif quote:
-        lines.append(f"Цитата: {_q(quote)} — дословно")
-    lines += [_raw_line(r, names) for r in raw_rows]
+        lines.append(f"{label}: {_q(quote)} — {'verbatim' if en else 'дословно'}")
+    lines += [
+        _raw_line(r, names, en=en, speaker=speaker if r["id"] in raws else None) for r in raw_rows
+    ]
     for i in parents:
         if i in shown_others:
-            lines.append(f"Выведено из: {_q(_shown(shown_others[i]))} [{handle(i)}]")
+            head = "Derived from" if en else "Выведено из"
+            lines.append(f"{head}: {_q(_shown(shown_others[i]))} [{handle(i)}]")
     for i in support:
         if i in shown_others:
-            lines.append(f"Опирается на: {_q(_shown(shown_others[i]))} [{handle(i)}]")
-    if rec.status in _STATUS_LINE:
-        line = _STATUS_LINE[rec.status]
+            head = "Rests on" if en else "Опирается на"
+            lines.append(f"{head}: {_q(_shown(shown_others[i]))} [{handle(i)}]")
+    status_lines = _STATUS_LINE_EN if en else _STATUS_LINE
+    if rec.status in status_lines:
+        line = status_lines[rec.status]
         new = next((i for i in later if i in shown_others), None)
         if new is not None:
-            line = f"Сейчас не используется: заменено на {_q(_shown(shown_others[new]))} [{handle(new)}]."
+            head = "Not in use now: replaced by" if en else "Сейчас не используется: заменено на"
+            line = f"{head} {_q(_shown(shown_others[new]))} [{handle(new)}]."
         lines.append(line)
     elif rec.status is Status.ARCHIVED:
-        lines.append("Сейчас в архиве: прошлое, не текущее.")
+        lines.append(
+            "Archived: past, not current." if en else "Сейчас в архиве: прошлое, не текущее."
+        )
     if rec.review:
-        lines.append("Надо перепроверить: что-то из опор изменилось.")
+        lines.append(
+            "Needs a re-check: something it rests on changed."
+            if en
+            else "Надо перепроверить: что-то из опор изменилось."
+        )
     if not raw_rows and not parents:
-        lines.append("Сообщения-источника нет: запись сделана напрямую.")
+        lines.append(
+            "No source message: recorded directly."
+            if en
+            else "Сообщения-источника нет: запись сделана напрямую."
+        )
     sources = [ReadRef(id=r["id"], version=int(r["rev"]), src=ReadSrc.RAW) for r in raw_rows]
     sources += [ReadRef(id=o.id, version=o.version) for o in shown_others.values()]
     return Lineage(item_id=rid, lines=lines, sources=sources)
 
 
 def where_from(conn: sqlite3.Connection, item_id: str, turn: TurnCtx) -> list[str]:
-    """«откуда это» (§17) in plain Russian lines."""
+    """«откуда это» (§17) in plain Russian (or English) lines."""
     return lineage(conn, item_id, turn).lines
 
 
@@ -1398,7 +2139,22 @@ def _forget_query(target: str) -> tuple[str, bool]:
     whole = bool(told) or bool(_ALL_ABOUT.search(f" {text} ")) or bool(_ALL_WORD.search(text))
     if told:
         text = text[: told.start()] + " " + text[told.end() :]
-    return text, whole
+    # «насовсем», "for good", "once and for all" say how, never what; «место
+    # работы», "place of work": the noun after it names the slot
+    text = _PLACE_OF.sub(" ", _FOREVER_WORD.sub(" ", text))
+    return " ".join(_TARGET_FILLER.sub(" ", text).split()), whole
+
+
+_PLACE_OF = re.compile(r"(?<!\w)(?:мест[оау]|place\s+of)\s+(?=[^\W\d_]{4,})", re.IGNORECASE)
+# Words of a forget order that name no topic: a question word for the slot ("where Veronika
+# works"), «старый» / "old" for the value being dropped, a placeholder noun ("the bakery thing",
+# «эту тему»), a discourse word («кстати», "btw")
+_TARGET_FILLER = re.compile(
+    r"(?<!\w)(?:where|when|which|what|who|how|кстати|btw|anyway|стар(?:ый|ая|ое|ую|ого|ой|ые|ых)"
+    r"|прежн(?:ий|яя|ее|юю|его|ей|ие|их)|old|previous|thing|things|stuff|business"
+    r"|тем[ауы]|штук[ау]|истори[юяи])(?!\w)",
+    re.IGNORECASE,
+)
 
 
 def _slot_cue(query: str) -> tuple[str, str | None]:
@@ -1420,6 +2176,81 @@ def _slot_ok(rec: AnyRecord, slot: str | None) -> bool:
     )
     want = "date:" if slot == "date" else "num:"
     return any(t.startswith(want) for t in toks)
+
+
+_PLAN_KINDS = frozenset(
+    {
+        RecordKind.INTENTION,
+        RecordKind.EPISODE,
+        RecordKind.DECISION,
+        RecordKind.WORK_STATE,
+        RecordKind.LOOP,
+    }
+)
+LAST_SAID_WINDOW_H = 6  # "scratch that" points at this sitting, not last week
+
+
+def _plan_ok(rec: AnyRecord) -> bool:
+    """A record a cancel can name: a plan, a promise, a decision, or a dated fact."""
+    return rec.kind in _PLAN_KINDS or _slot_ok(rec, "date")
+
+
+def _last_said(conn: sqlite3.Connection, turn: TurnCtx) -> str | None:
+    """The user's own last message before this turn, still in use and from this sitting: the one
+    an object-less «вычеркни это» / "scratch that" with no earlier forget points at."""
+    from datetime import timedelta
+
+    from . import clock as _clockmod
+
+    since = _clockmod.iso(_clockmod.now() - timedelta(hours=LAST_SAID_WINDOW_H))
+    row = conn.execute(
+        "SELECT id, text FROM raw_chunks WHERE source_kind IN ('owner', 'island')"
+        " AND status = 'active' AND author_tier IN ('user', 'user_confirmed')"
+        " AND junk = 0 AND quarantined = 0 AND (turn_id IS NULL OR turn_id != ?) AND ts >= ?"
+        " ORDER BY ts DESC, fts_rowid DESC LIMIT 1",
+        (turn.turn_id, since),
+    ).fetchone()
+    if row is None or safe_text.order_kind(row[1]) is not None:
+        return None  # the last words were an order themselves: nothing to take back
+    return str(row[0])
+
+
+SHOWN_MAX = 3  # «забудь это» after a long list names nothing in particular
+
+
+def _raw_ts(conn: sqlite3.Connection, raw_id: str | None) -> str | None:
+    if raw_id is None:
+        return None
+    row = conn.execute("SELECT ts FROM raw_chunks WHERE id = ?", (raw_id,)).fetchone()
+    return str(row[0]) if row else None
+
+
+def _last_shown(conn: sqlite3.Connection, turn: TurnCtx, *, after: str | None) -> list[str]:
+    """The records the brain fetched for this thread's last turn before this one, newer than
+    the user's last message (`after`): what an object-less «забудь это» / "drop that" points at
+    right after they were shown. At most `SHOWN_MAX`, still in use; none when nothing was fetched."""
+    row = conn.execute(
+        "SELECT turn_id, created_at FROM served WHERE thread_id = ? AND via = 'tool'"
+        " AND turn_id IS NOT NULL AND turn_id != ? ORDER BY id DESC LIMIT 1",
+        (turn.thread_id, turn.turn_id),
+    ).fetchone()
+    if row is None or (after is not None and str(row[1]) < after):
+        return []
+    ids = [
+        str(r[0])
+        for r in conn.execute(
+            "SELECT DISTINCT item_id FROM served WHERE thread_id = ? AND via = 'tool'"
+            " AND turn_id = ? ORDER BY id",
+            (turn.thread_id, row[0]),
+        )
+    ]
+    recs = _records(conn, ids)
+    keep = [
+        rid
+        for rid in ids
+        if rid in recs and recs[rid].kind is not RecordKind.ENTITY and _usable(recs[rid])
+    ]
+    return keep if 0 < len(keep) <= SHOWN_MAX else []
 
 
 def _hits(terms: Iterable[str], words: Iterable[str]) -> set[str]:
@@ -1748,7 +2579,7 @@ def _topic_target(
 
 
 def _resolve_target(
-    conn: sqlite3.Connection, target: str, scope: ForgetScope, turn: TurnCtx
+    conn: sqlite3.Connection, target: str, scope: ForgetScope, turn: TurnCtx, *, plan: bool = False
 ) -> _Target:
     target = (target or "").strip()
     if scope is ForgetScope.CHAT:
@@ -1794,9 +2625,17 @@ def _resolve_target(
     found = _find(conn, query, include_history=True)
     if not found.scored:  # a topic word, not one fact («забудь про накопления»)
         return _topic_target(conn, named, rest, query, turn)
-    if slot is not None:
+    if slot is not None or plan:
         found.scored = sorted(
-            ((s + (0.5 if _slot_ok(found.recs[r], slot) else 0.0), r) for s, r in found.scored),
+            (
+                (
+                    s
+                    + (0.5 if _slot_ok(found.recs[r], slot) else 0.0)
+                    + (0.5 if plan and _plan_ok(found.recs[r]) else 0.0),
+                    r,
+                )
+                for s, r in found.scored
+            ),
             key=lambda x: (-x[0], x[1]),
         )
     best = found.scored[0][0]
@@ -1879,7 +2718,7 @@ def forget_now(
     without the user's «насовсем» → `ask_first`, before the target is even resolved."""
     if _his_word_needed(turn):
         words = policy.turn_words(turn)
-        if not _FORGET_VERB.search(words):
+        if not _FORGET_VERB.search(words) and safe_text.order_kind(words) is None:
             return _result(
                 outcome="ask_first",
                 line="Забывать ты не просил — это из чужого текста. Забыть — скажешь сам?",
@@ -1890,11 +2729,26 @@ def forget_now(
                 line="Удалить насовсем, без «Вернуть»? Скажи «насовсем» сам — "
                 "или просто перестану использовать.",
             )
+    # every colloquial form is «забудь» with its object kept («выкинь из головы»,
+    # «не держи это в голове», "scratch that"); a cancel («отмени встречу») forgets the plan
+    # it names, so plan records rank first
+    # «отбой», «не надо уже», "never mind the dentist": a cancel said without the verb
+    said = scope is not ForgetScope.CHAT and said_cancel(target)
+    cancel = said or (scope is not ForgetScope.CHAT and safe_text.order_kind(target) == "cancel")
+    if scope is not ForgetScope.CHAT and not handles_in(target):
+        target = _canon_cancel(target) if said else target
+        target = _order_part(safe_text.canon_order(target))
     if scope is not ForgetScope.CHAT and _object_less(target):
-        again = _thread_forget(conn, turn)
+        again = None if cancel else _thread_forget(conn, turn)
         if again is not None:  # «Забудь насовсем» after «верни»: the user's latest forget
             return _forget_again(conn, again, turn=turn, forever=forever)
-    t = _resolve_target(conn, target, scope, turn)
+        said = _last_said(conn, turn)
+        shown = _last_shown(conn, turn, after=_raw_ts(conn, said))
+        if shown:  # «забудь это», "drop that" right after the brain showed it: those items
+            target = " ".join(f"m:{rid}" for rid in shown)
+        elif said is not None:  # "scratch that" right after the user said it: that message
+            target = f"m:{said}"
+    t = _resolve_target(conn, target, scope, turn, plan=cancel)
     if t.missing:
         return _result(outcome="not_found", line=t.missing)
     if t.ask:

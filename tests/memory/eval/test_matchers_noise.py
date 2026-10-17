@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from koob.memory.eval.loader import load_set
-from koob.memory.eval.matchers import find
+from koob.memory.eval.matchers import find, shown_as_current
 from koob.memory.eval.noise import expand
 from koob.memory.eval.schema import Noise
 
@@ -31,6 +31,34 @@ DEV = Path(__file__).resolve().parents[3] / "evals" / "memory" / "dev"
 )
 def test_find(text, val, ok):
     assert find(text, val) is ok
+
+
+@pytest.mark.parametrize(
+    "text,val,ok",
+    [
+        ("Поездка 3–5 июня", "2026-06-03", True),  # the start day of a D–D month range
+        ("Trip 3-5 June", "--06-03", True),
+        ("trip 3 to 5 june", "--06-03", True),
+        ("Еду со 2 по 9 января", "--01-02", True),
+        ("23 и 24 октября", "--10-23", True),
+        ("Поездка 3–5 июня", "--06-05", True),  # the end day, as before
+        ("June 3–5", "--06-03", True),
+        ("June 3–5", "--06-05", True),  # the end day of a month-first range
+        ("13–15 июня", "--06-03", False),
+        ("3–15 июня", "--06-05", False),
+        ("June 13–15", "--06-03", False),
+        ("в 3 часа, 5 июня", "--06-03", False),
+    ],
+)
+def test_a_date_range_names_its_days(text, val, ok):
+    assert find(text, {"date": val}) is ok
+
+
+def test_a_stale_date_inside_a_range_is_caught_unless_marked_as_history():
+    old = {"date": "--10-16"}
+    assert shown_as_current("Конференция 16–17 октября.", old)
+    assert not shown_as_current("Конференция 23–24 октября, вместо 16–17 октября.", old)
+    assert not shown_as_current("Конференция 23–24 октября.", old)
 
 
 def _noise(**kw):

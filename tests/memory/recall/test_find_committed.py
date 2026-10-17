@@ -1,10 +1,9 @@
 """The finder brings back the user's committed facts.
 
-- natural questions reach the record through its entity and relation: the
+- natural questions reach the record through its entity and relation (the pet example): the
   first person, a relation word («где живу», «брат»), the question word (where, when, who);
 - remove only what is proven wrong: a broad label (legal, unknown) on the user's own record is
-  no proof it does not apply when the user's question asks for it; health keeps the policy's
-  own test;
+  no proof it does not apply when the question asks for it; health keeps the policy's own test;
 - name forms (#12): a declined diminutive meets its name by morphology and by its family; a
   name in the other script meets the record by transliteration;
 - the value is in the line: the source-language keywords the value lacks.

@@ -1,4 +1,4 @@
-"""Tool-routed probes (BENCH-2 #3).
+"""Tool-routed probes.
 
 An inspect or scout probe (or one with `route:`) is answered by the memory tools; the
 view-level check also counts what the tool returns for the question, for every system that
@@ -155,3 +155,44 @@ def test_api_where_from_reads_what_the_thread_was_shown_before_this_turn():
     assert "Сапфир" in text and "1 июля" in text
     other = TurnCtx(turn_id="bench", thread_id="th-new", session_id="s2", owner_words="Откуда это?")
     assert "Сапфир" not in api_tool_text(conn, "Откуда это?", other, TOOLS)  # another thread
+
+
+def test_followup_where_from_reaches_record_the_previous_bench_wording_was_shown(monkeypatch):
+    """Each bench wording is its own turn: the view opens it, the tools of that wording read in
+    it, so a chained «Откуда это?» reaches the record the previous wording's answer showed."""
+    from koob.memory import store
+    from koob.memory.eval import sut as sut_mod
+    from koob.memory.eval.routes import api_tool_text
+
+    conn = store.open(":memory:")
+    t = "2026-03-02T09:00:00"
+    conn.execute(
+        "INSERT INTO records (id, kind, version, status, author_tier, recorded_at, created_at,"
+        " updated_at, origin_quote) VALUES ('f1', 'fact', 1, 'active', 'user', ?, ?, ?, ?)",
+        (t, t, t, "Запомни: мой размер перчаток 8."),
+    )
+    conn.execute(
+        "INSERT INTO facts (id, subject_id, relation, value_text, text_en, fkind) SELECT 'f1',"
+        " 'self', relation, '8', 'Denis Smith wears size 8 gloves', 'state'"
+        " FROM relations LIMIT 1"
+    )
+    seen: list = []
+
+    def tool_view(self, route, wording, turn=None):  # noqa: ANN001, ANN202
+        seen.append(turn)
+        return api_tool_text(conn, wording, turn, ("memory_where_from",))
+
+    monkeypatch.setattr(sut_mod.ApiSUT, "tool_view", tool_view)
+    sut = bench.ApiBenchSUT.__new__(bench.ApiBenchSUT)
+    sut._turn_n, sut._turn = 0, None
+    first = sut._new_turn("Что ты обо мне помнишь?")
+    sut.tool_view("tool", "Что ты обо мне помнишь?")
+    conn.execute(
+        "INSERT INTO served (thread_id, item_id, item_kind, version, turn_id, via, created_at)"
+        " VALUES (?, 'f1', 'fact', 1, ?, 'tool', ?)",
+        (first.thread_id, first.turn_id, t),
+    )
+    second = sut._new_turn("Откуда это?")
+    text = sut.tool_view("tool", "Откуда это?")
+    assert seen == [first, second] and first.turn_id != second.turn_id
+    assert "перчаток" in text and "2 марта" in text

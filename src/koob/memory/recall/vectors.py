@@ -1,11 +1,16 @@
-"""Record embeddings in a separate, rebuildable `vectors.db` keyed (record_id, embedder_id);
-in-process embedder, fp16 matrix, brute force under a 40 ms deadline; orphan sweep at open.
+"""Record and raw-message embeddings in a separate, rebuildable `vectors.db` keyed
+(record_id, embedder_id); in-process embedder, fp16 matrix, brute force under a 40 ms
+deadline; orphan sweep at open.
 
 Spec: §3.1, §3.2 invariants, §9.1a, §10.2, §10.3, §18 (G12).
 
 - **File.** `vectors.db` beside memory.db holds `vectors(record_id, embedder_id, version,
-  labels, own, dim, vec)` (fp16, L2-normalised) and `vmeta` (`schema`, `serving`). It is never
-  backed up and may be deleted at any time: the next `embed` job rebuilds it.
+  labels, own, dim, vec, raw)` (fp16, L2-normalised) and `vmeta` (`schema`, `serving`). It is
+  never backed up and may be deleted at any time: the next `embed` job rebuilds it.
+- **Raw messages.** Usable raw chunks (active, not quarantined, not junk) are embedded too,
+  in their own language, as rows with `raw = 1` keyed by the chunk id and versioned by its
+  `rev` (a redaction bumps it: the redacted text is re-embedded, the old vector goes).
+  `search_split` scores both kinds in one scan: the records' meaning lane and the raw one.
 - **Pull model.** `embed_pending` embeds usable records (active/archived) that have no vector
   for the current embedder (or one of an older record version). It runs as the background job
   kind `embed` (`store.register_job_runner`, not at startup); `enqueue` files that job.
@@ -13,12 +18,19 @@ Spec: §3.1, §3.2 invariants, §9.1a, §10.2, §10.3, §18 (G12).
   old vectors keep serving until the new embedder covers every embeddable record; then
   `serving` switches, the old rows go and `meta.embedder_id` in memory.db follows.
 - **Hot path.** `search` scans the in-RAM fp16 matrix in chunks and stops at its deadline
-  (partial or empty, never blocking the turn). `embed_query` never loads a model on the turn:
-  the first call starts a local-only background load and returns []. Without fastembed both
-  return [] and log once; nothing here raises into recall.
-- **Forget (§9.1a, §9.1d).** forget.py deletes rows of forgotten ids; `stop_hook` drops them
-  from RAM; `sweep_orphans` (startup and purge) deletes rows and RAM entries of records that
-  are not usable, which heals a crash between the ledger commit and the vector delete.
+  (partial or empty, never blocking the turn). The matrix belongs to one attached file, named
+  by its resolved path: SQLite reports a connection's file with symlinks resolved (`/var` is
+  `/private/var` on macOS), so an unresolved name would never match the file a job wrote and
+  RAM would keep the first load forever. Every `embed_pending` re-reads RAM when it wrote the
+  attached file; a background load never replaces a newer index (a generation count).
+  `embed_query` never loads a model on the turn: the first call starts a local-only
+  background load and returns []. Without fastembed both return [] and log once; nothing
+  here raises into recall.
+- **Forget (§9.1a, §9.1d).** forget.py deletes rows of forgotten record ids; `stop_hook`
+  drops the event's record and raw ids from RAM and deletes their rows from the attached
+  file; `sweep_orphans` (startup and purge) deletes rows and RAM entries of records and raws
+  that are not usable (and raw rows of an older `rev`), which heals a crash between the
+  ledger commit and the vector delete.
 - **Labels.** Rows carry the record's labels and own-ness, refreshed by every `embed_pending`;
   the mask here is the finders' fence (a superset), use-now (`policy.decide`) still decides.
 """
@@ -52,6 +64,8 @@ BATCH = 32  # documents per embedding call and per vectors.db transaction
 _USABLE_SQL = "('active', 'archived')"
 _OWN_TIERS = ("user", "user_confirmed")  # policy._OWN_SQL: user's own items pass the label fence
 _SQL_CHUNK = 400
+RAW_CHARS = 1_000  # a raw message is embedded from its first characters (chunks are short)
+_RAW_USABLE_SQL = "status = 'active' AND quarantined = 0 AND junk = 0 AND text IS NOT NULL"
 
 # The text each record kind is embedded from (records are stored in English, §10.3).
 _TEXT_SQL = (
@@ -65,6 +79,12 @@ _TEXT_SQL = (
     " LEFT JOIN episodes e ON e.id = r.id"
     f" WHERE r.status IN {_USABLE_SQL}"
 )
+# Raw messages are embedded from their own text, in the language they were written in.
+_RAW_TEXT_SQL = (
+    "SELECT c.id, c.rev, c.labels, c.author_tier, substr(c.text, 1, ?) AS text"
+    " FROM raw_chunks c WHERE c.status = 'active' AND c.quarantined = 0 AND c.junk = 0"
+    " AND c.text IS NOT NULL"
+)
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS vmeta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -77,6 +97,7 @@ CREATE TABLE IF NOT EXISTS vectors (
     dim          INTEGER NOT NULL,
     vec          BLOB NOT NULL,
     embedded_at  TEXT NOT NULL,
+    raw          INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (record_id, embedder_id)
 );
 CREATE INDEX IF NOT EXISTS vectors_embedder ON vectors (embedder_id);
@@ -279,6 +300,14 @@ def current_embedder(*, wait: bool = False, allow_download: bool = False) -> Emb
     return _load(spec, allow_download=allow_download)
 
 
+def embedder_ready() -> bool:
+    """Whether an embedder is in RAM now (injected or loaded); never starts a load."""
+    if _injected[0] is not None:
+        return True
+    with _lock:
+        return configured_spec().id in _models
+
+
 def _embedder_for(embedder_id: str | None) -> Embedder | None:
     """The embedder whose vectors are serving (queries must match them), else the current."""
     inj = _injected[0]
@@ -337,6 +366,9 @@ def _ensure_schema(vdb: sqlite3.Connection) -> None:
     if have is not None:
         row = vdb.execute("SELECT value FROM vmeta WHERE key = 'schema'").fetchone()
         if row is not None and int(row[0]) == SCHEMA:
+            cols = {r[1] for r in vdb.execute("PRAGMA table_info(vectors)")}
+            if cols and "raw" not in cols:  # a file from before raw rows: record rows stay
+                vdb.execute("ALTER TABLE vectors ADD COLUMN raw INTEGER NOT NULL DEFAULT 0")
             return
         vdb.executescript("DROP TABLE IF EXISTS vectors; DROP TABLE IF EXISTS vmeta;")
     vdb.executescript(_DDL)
@@ -359,17 +391,26 @@ def _set_serving(vdb: sqlite3.Connection, embedder_id: str) -> None:
 
 
 def _usable(memory: sqlite3.Connection, ids: Iterable[str]) -> set[str]:
+    """The ids that may hold a vector: usable records and usable raw chunks."""
+    return set(_usable_versions(memory, ids))
+
+
+def _usable_versions(memory: sqlite3.Connection, ids: Iterable[str]) -> dict[str, int | None]:
+    """Usable ids -> the raw chunk's current `rev` (None for a record, whose version
+    `embed_pending` checks)."""
     ids = list(ids)
-    out: set[str] = set()
+    out: dict[str, int | None] = {}
     for i in range(0, len(ids), _SQL_CHUNK):
         chunk = ids[i : i + _SQL_CHUNK]
         qs = ",".join("?" * len(chunk))
-        out.update(
-            r[0]
-            for r in memory.execute(
-                f"SELECT id FROM records WHERE id IN ({qs}) AND status IN {_USABLE_SQL}", chunk
-            )
-        )
+        for r in memory.execute(
+            f"SELECT id FROM records WHERE id IN ({qs}) AND status IN {_USABLE_SQL}", chunk
+        ):
+            out[r[0]] = None
+        for r in memory.execute(
+            f"SELECT id, rev FROM raw_chunks WHERE id IN ({qs}) AND {_RAW_USABLE_SQL}", chunk
+        ):
+            out[r[0]] = int(r[1])
     return out
 
 
@@ -407,9 +448,9 @@ def embed_pending(
     batch_size: int = BATCH,
     on_batch: Callable[[int], None] | None = None,
 ) -> int:
-    """Embed usable records lacking a vector for the current embedder (or holding one of an
-    older record version); refresh labels of the rest; switch `serving` once a new embedder
-    covers everything (G12). Returns the vectors written. Background only."""
+    """Embed usable records and raw chunks lacking a vector for the current embedder (or
+    holding one of an older version); refresh labels of the rest; switch `serving` once a new
+    embedder covers everything (G12). Returns the vectors written. Background only."""
     emb = current_embedder(wait=True, allow_download=True)
     if emb is None:
         return 0
@@ -425,17 +466,22 @@ def embed_pending(
             "SELECT record_id, version, labels, own FROM vectors WHERE embedder_id = ?", (emb.id,)
         )
     }
-    todo: list[tuple[str, int, int, int, str]] = []
+    todo: list[tuple[str, int, int, int, str, int]] = []
     relabel: list[tuple[int, int, str]] = []
-    for rid, ver, labels, tier, text in memory.execute(_TEXT_SQL):
-        if not (text or "").strip():
-            continue
-        own = int(tier in _OWN_TIERS)
-        old = have.get(rid)
-        if old is None or old[0] != int(ver):
-            todo.append((rid, int(ver), int(labels), own, text))
-        elif old[1:] != (int(labels), own):
-            relabel.append((int(labels), own, rid))
+    sources = (
+        (memory.execute(_TEXT_SQL), 0),
+        (memory.execute(_RAW_TEXT_SQL, (RAW_CHARS,)), 1),
+    )
+    for rows, is_raw in sources:
+        for rid, ver, labels, tier, text in rows:
+            if not (text or "").strip():
+                continue
+            own = int(tier in _OWN_TIERS)
+            old = have.get(rid)
+            if old is None or old[0] != int(ver):
+                todo.append((rid, int(ver), int(labels), own, text, is_raw))
+            elif old[1:] != (int(labels), own):
+                relabel.append((int(labels), own, rid))
     if relabel:
         with _tx(vectors):
             vectors.executemany(
@@ -450,15 +496,16 @@ def embed_pending(
         with _tx(vectors):
             vectors.executemany(
                 "INSERT OR REPLACE INTO vectors (record_id, embedder_id, version, labels, own,"
-                " dim, vec, embedded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                " dim, vec, embedded_at, raw) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
-                    (b[0], emb.id, b[1], b[2], b[3], emb.dim, mat[j].tobytes(), stamp)
+                    (b[0], emb.id, b[1], b[2], b[3], emb.dim, mat[j].tobytes(), stamp, b[5])
                     for j, b in enumerate(batch)
                 ],
             )
-        # a record forgotten while we embedded: its row goes now (forget deletes first, so
-        # one of the two always sees the other)
-        gone = sorted({b[0] for b in batch} - _usable(memory, [b[0] for b in batch]))
+        # a record or raw forgotten (or redacted) while we embedded: its row goes now
+        # (forget deletes first, so one of the two always sees the other)
+        live = _usable_versions(memory, [b[0] for b in batch])
+        gone = sorted(b[0] for b in batch if b[0] not in live or (b[5] and live[b[0]] != b[1]))
         if gone:
             with _tx(vectors):
                 _delete_ids(vectors, gone, emb.id)
@@ -491,7 +538,7 @@ def sweep_orphans(memory: sqlite3.Connection, vectors: sqlite3.Connection) -> in
     in vectors.db and in RAM; attaches the hot path to this file. Returns rows deleted."""
     if memory is None or vectors is None:
         return 0
-    path = store.db_file(vectors)
+    path = _resolved(store.db_file(vectors))
     if path is not None and _attached[0] is None:
         attach(path)
     ram = _index[0]
@@ -499,8 +546,9 @@ def sweep_orphans(memory: sqlite3.Connection, vectors: sqlite3.Connection) -> in
         ram.drop(set(ram.ids) - _usable(memory, ram.ids))
     if not _has_schema(vectors):
         return 0
-    ids = [r[0] for r in vectors.execute("SELECT DISTINCT record_id FROM vectors")]
-    bad = sorted(set(ids) - _usable(memory, ids))
+    rows = vectors.execute("SELECT record_id, version, raw FROM vectors").fetchall()
+    live = _usable_versions(memory, {r[0] for r in rows})
+    bad = sorted({r[0] for r in rows if r[0] not in live or (r[2] and live[r[0]] != int(r[1]))})
     if bad:
         with _tx(vectors):
             _delete_ids(vectors, bad)
@@ -552,8 +600,8 @@ store.register_job_runner(JOB_KIND, _run_job)
 
 
 class _Index:
-    """fp16 matrix + ids + labels + own + alive, for one embedder. Copy-on-grow, so a search
-    holding the old arrays never sees a half-built one."""
+    """fp16 matrix + ids + labels + own + raw + alive, for one embedder. Copy-on-grow, so a
+    search holding the old arrays never sees a half-built one."""
 
     def __init__(
         self,
@@ -563,6 +611,7 @@ class _Index:
         mat: np.ndarray,
         labels: np.ndarray,
         own: np.ndarray,
+        raw: np.ndarray | None = None,
     ) -> None:
         self.embedder_id = embedder_id
         self.dim = dim
@@ -571,6 +620,7 @@ class _Index:
         self.mat = mat
         self.labels = labels
         self.own = own
+        self.raw = raw if raw is not None else np.zeros(len(ids), bool)
         self.alive = np.ones(len(ids), bool)
 
     def drop(self, ids: Iterable[str]) -> None:
@@ -581,8 +631,14 @@ class _Index:
 
 
 _index: list[_Index | None] = [None]
-_attached: list[Path | None] = [None]
+_attached: list[Path | None] = [None]  # resolved (`_resolved`), so it compares with db_file
 _load_started: list[bool] = [False]
+_generation: list[int] = [0]  # bumped by every attach and refresh: an older load is dropped
+
+
+def _resolved(path: Path | str | None) -> Path | None:
+    """`path` with symlinks resolved (the file need not exist yet), as SQLite names it."""
+    return Path(path).resolve() if path is not None else None
 
 
 def _read_index(vdb: sqlite3.Connection) -> _Index | None:
@@ -590,7 +646,7 @@ def _read_index(vdb: sqlite3.Connection) -> _Index | None:
     if sid is None:
         return None
     rows = vdb.execute(
-        "SELECT record_id, labels, own, dim, vec FROM vectors WHERE embedder_id = ?"
+        "SELECT record_id, labels, own, dim, vec, raw FROM vectors WHERE embedder_id = ?"
         " ORDER BY record_id",
         (sid,),
     ).fetchall()
@@ -610,6 +666,7 @@ def _read_index(vdb: sqlite3.Connection) -> _Index | None:
         mat,
         np.array([int(r[1]) for r in rows], np.int64),
         np.array([bool(r[2]) for r in rows], bool),
+        np.array([bool(r[5]) for r in rows], bool),
     )
 
 
@@ -617,37 +674,41 @@ def attach(path: Path | str | None, *, load: bool = False) -> None:
     """Point the hot path at a vectors.db (None detaches). `load=True` reads it now;
     otherwise the first search starts a background load."""
     with _lock:
-        _attached[0] = Path(path) if path is not None else None
+        _attached[0] = _resolved(path)
         _index[0] = None
         _load_started[0] = False
+        _generation[0] += 1
     if load and path is not None:
         load_index()
 
 
 def load_index() -> bool:
-    """Read the attached vectors.db into RAM (background or warm-up, never the turn)."""
-    path = _attached[0]
-    if path is None or not path.exists():
-        return False
+    """Read the attached vectors.db into RAM (background or warm-up, never the turn). A load
+    that finds no file or no index lets the next search try again; one that an attach or a
+    refresh overtook while it read keeps its result out of RAM."""
+    with _lock:
+        path, gen = _attached[0], _generation[0]
+    idx: _Index | None = None
     try:
-        vdb = store.connect(path)
-        try:
-            idx = _read_index(vdb) if _has_schema(vdb) else None
-        finally:
-            vdb.close()
+        if path is not None and path.exists():
+            vdb = store.connect(path)
+            try:
+                idx = _read_index(vdb) if _has_schema(vdb) else None
+            finally:
+                vdb.close()
     except Exception as exc:
         _log_once("load_index", "memory vectors: index not loaded (%s)", type(exc).__name__)
-        return False
     with _lock:
-        if _attached[0] == path:
+        if _generation[0] == gen and _attached[0] == path:
             _index[0] = idx
+            _load_started[0] = idx is not None
     return idx is not None
 
 
 def _refresh_ram(vdb: sqlite3.Connection) -> None:
     """After `embed_pending`: re-read the index when the hot path uses this file (or uses
-    none yet)."""
-    path = store.db_file(vdb)
+    none yet), so the next turn's search sees every row this pass wrote."""
+    path = _resolved(store.db_file(vdb))
     if path is None:
         return
     if _attached[0] is None:
@@ -655,12 +716,32 @@ def _refresh_ram(vdb: sqlite3.Connection) -> None:
     if _attached[0] == path:
         idx = _read_index(vdb)
         with _lock:
-            _index[0] = idx
+            if _attached[0] == path:
+                _index[0] = idx
+                _load_started[0] = True
+                _generation[0] += 1
 
 
 def stop_hook(event: Any) -> None:
-    """§9.1d: the forget cache hook (`api.wire(stop_hooks=[vectors.stop_hook])`)."""
-    drop(getattr(event, "record_ids", None) or [])
+    """§9.1d: the forget cache hook (`api.wire(stop_hooks=[vectors.stop_hook])`). Forgotten
+    and redacted raw chunks leave RAM and the attached vectors.db at once (forget.py deletes
+    the record rows itself; the purge's orphan sweep re-checks both)."""
+    raw_ids = list(getattr(event, "raw_ids", None) or [])
+    drop([*(getattr(event, "record_ids", None) or []), *raw_ids])
+    path = _attached[0]
+    if not raw_ids or path is None or not path.exists():
+        return
+    try:
+        vdb = store.connect(path)
+        try:
+            if _has_schema(vdb):
+                with _tx(vdb):
+                    _delete_ids(vdb, raw_ids)
+        finally:
+            vdb.close()
+    except Exception as exc:  # the purge's sweep deletes them; a forget never fails here
+        _log_once("stop_hook", "memory vectors: raw rows not deleted at stop (%s)",
+                  type(exc).__name__)  # fmt: skip
 
 
 def drop(record_ids: Iterable[str]) -> None:
@@ -676,6 +757,7 @@ def reset() -> None:
         _index[0] = None
         _attached[0] = None
         _load_started[0] = False
+        _generation[0] += 1
         _models.clear()
         _failed.clear()
         _logged.clear()
@@ -688,16 +770,33 @@ def search(
     query_vec: list[float], *, label_mask: int, deadline_ms: float = 40.0, limit: int = 50
 ) -> list[tuple[str, float]]:
     """Brute-force cosine over the in-RAM fp16 matrix: `(record_id, score)` best first, only
-    rows whose labels fit `label_mask` (or the user's own items). Past the deadline the scan
-    stops: what was scored so far comes back (possibly nothing). Never raises, never blocks."""
+    record rows whose labels fit `label_mask` (or the user's own items). Past the deadline the
+    scan stops: what was scored so far comes back (possibly nothing). Never raises, never blocks."""
+    return search_split(query_vec, label_mask=label_mask, deadline_ms=deadline_ms,
+                        limit=limit, raw_limit=0)[0]  # fmt: skip
+
+
+def search_split(
+    query_vec: list[float],
+    *,
+    label_mask: int,
+    deadline_ms: float = 40.0,
+    limit: int = 50,
+    raw_limit: int = 50,
+) -> tuple[list[tuple[str, float]], list[tuple[str, float]]]:
+    """One scan, two lanes: the best `limit` record rows and the best `raw_limit` raw-message
+    rows, each `(id, score)` best first, under the same label fence and deadline as
+    `search`. Never raises, never blocks."""
     t0 = _now()
     try:
         idx = _index[0]
         if idx is None:
             _kick_load()
-            return []
-        if not query_vec or len(query_vec) != idx.dim or not idx.ids or limit <= 0:
-            return []
+            return [], []
+        if not query_vec or len(query_vec) != idx.dim or not idx.ids:
+            return [], []
+        if limit <= 0 and raw_limit <= 0:
+            return [], []
         q = _unit(np.asarray(query_vec, np.float32))
         n = len(idx.ids)
         scores = np.full(n, -np.inf, np.float32)
@@ -711,19 +810,27 @@ def search(
             scores[start:end] = idx.mat[start:end].astype(np.float32) @ q
             done = end
         if done == 0:
-            return []
+            return [], []
         ok = idx.alive[:done] & (((idx.labels[:done] & ~int(label_mask)) == 0) | idx.own[:done])
-        cand = np.flatnonzero(ok)
-        if cand.size == 0:
-            return []
-        s = scores[cand]
-        k = min(limit, cand.size)
-        top = np.argpartition(-s, k - 1)[:k]
-        top = top[np.argsort(-s[top], kind="stable")]
-        return [(idx.ids[int(cand[t])], float(s[t])) for t in top]
+        is_raw = idx.raw[:done]
+        return (
+            _best(idx, scores, ok & ~is_raw, limit),
+            _best(idx, scores, ok & is_raw, raw_limit),
+        )
     except Exception as exc:
         _log_once("search", "memory vectors: search failed (%s)", type(exc).__name__)
+        return [], []
+
+
+def _best(idx: _Index, scores: np.ndarray, ok: np.ndarray, limit: int) -> list[tuple[str, float]]:
+    cand = np.flatnonzero(ok)
+    if cand.size == 0 or limit <= 0:
         return []
+    s = scores[cand]
+    k = min(limit, cand.size)
+    top = np.argpartition(-s, k - 1)[:k]
+    top = top[np.argsort(-s[top], kind="stable")]
+    return [(idx.ids[int(cand[t])], float(s[t])) for t in top]
 
 
 def _kick_load() -> None:

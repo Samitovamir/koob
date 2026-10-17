@@ -41,7 +41,7 @@ log = logging.getLogger(__name__)
 FINDER_DEADLINES_MS: dict[str, float] = {
     "names": 20,
     "lexical": 30,
-    "vector": 40,
+    "vector": 80,  # the query embedding runs beside the other finders; a loaded machine needs more than 40
     "scope": 20,
     "relation": 20,
     "recency": 10,
@@ -49,7 +49,16 @@ FINDER_DEADLINES_MS: dict[str, float] = {
     "assoc": 10,
 }
 LANE_LIMIT = 30
-VEC_FLOOR = 0.55  # cosine a meaning-only hit needs to count as evidence
+RAW_LIMIT = 20  # raw-message hits per raw lane (stemmed text and meaning)
+# A meaning hit on a raw message counts as a lane only this close to the best one: brute force
+# always returns `RAW_LIMIT` rows, and in a small store those are most of the messages.
+RAW_VEC_REL = 0.8
+DUP_COVER = 0.8  # share of a raw's words its facts' quotes must hold to make it a duplicate
+RAW_VEC_MIN = 0.35  # and never below this cosine (unrelated short messages score ~0.1-0.25)
+VEC_FLOOR = 0.55  # cosine a meaning-only hit needs to count as evidence anywhere in the lane
+VEC_TOP = 2  # the lane's best hits may count as evidence below that floor (see `_vector_evidence`)
+VEC_TOP_FLOOR = 0.40
+VEC_TOP_MARGIN = 0.06  # how close to the lane's best such a hit must stay
 COVERAGE = 0.5  # share of the question's topic stems a text hit must hold
 RECENT_DAYS = 30
 LINE_CHARS = 200  # longer texts are clipped; the `[m:<id>]` handle expands them
@@ -194,6 +203,72 @@ def _relation(
     return sorted(out.items(), key=lambda h: -h[1])
 
 
+PAST_LINES = 2  # superseded values one past question may see
+
+
+def _past_items(
+    conn, turn: TurnCtx, cue: cue_mod.Cue, fence: str, fp: list[int], frozen: set[str]
+) -> list[Any]:
+    """A question about the past («где мы жили прошлой зимой», "where did we live before the
+    move") is answered by the value that was true then: the superseded facts of the asked
+    relation, each as a line marked past with the day it changed (never shown as current).
+    Only superseded, never retracted (proven wrong) or forgotten. The line is read through
+    the record's source raw (their words then, still active), so the read set holds no
+    superseded record: the pre-send check still refuses the record itself as current.
+    A period in the question («в марте», «летом») keeps the values that overlap it."""
+    from ..api import Item
+
+    if not cue.past or not cue.relations:
+        return []
+    named = cue.entity_ids[:4]
+    subjects = list(named)
+    if cue.self_ref or not named or any(r in cue_mod._KIN for r in cue.relations):
+        subjects.append("self")
+    rows = conn.execute(
+        "SELECT r.id, r.labels, r.author_tier, r.recorded_at, r.retired_at, f.valid_from,"
+        " f.text_en, f.value_text, f.subject_id, ch.id AS raw_id, ch.rev AS raw_rev, ch.ts AS raw_ts"
+        " FROM facts f JOIN records r ON r.id = f.id JOIN raw_chunks ch ON ch.id = f.source_raw_id"
+        f" WHERE f.subject_id IN ({_marks(len(subjects))})"
+        f" AND f.relation IN ({_marks(len(cue.relations))}) AND r.status = 'superseded'"
+        " AND ch.status = 'active' AND ch.quarantined = 0 AND ch.junk = 0"
+        f" AND f.text_en IS NOT NULL AND {fence} ORDER BY r.retired_at DESC LIMIT 8",
+        [*subjects, *cue.relations, *fp],
+    ).fetchall()
+    out: list[Any] = []
+    seen: set[str] = set()
+    for r in rows:
+        if r["id"] in frozen or r["raw_id"] in seen or not r["retired_at"]:
+            continue
+        # held since it began, or since the user's words said it (a record may be minted later)
+        since = r["valid_from"] or min(x for x in (r["recorded_at"], r["raw_ts"]) if x)
+        if cue.dates and _overlap(since, r["retired_at"], cue.dates[0]) is False:
+            continue
+        use = policy.decide_retired(conn, r["id"], turn)
+        own_asked = (
+            r["author_tier"] in _OWN
+            and not Label(int(r["labels"] or 0)) & policy.sensitive_mask() & ~_ASKED_LABELS
+        )
+        if not use.allowed and not (use.reason == "own_not_applicable" and own_asked):
+            continue
+        tier = r["author_tier"]
+        value = clean(r["value_text"] or "", tier=tier)
+        text = _clip(r["text_en"], LINE_CHARS, tier) + (f" — «{value}»" if value else "")
+        seen.add(r["raw_id"])
+        out.append(
+            Item(
+                id=r["raw_id"],
+                kind="raw",
+                version=int(r["raw_rev"]),
+                text=f"в прошлом, до {r['retired_at'][:10]} · {text}",
+                author_tier=AuthorTier(tier) if tier else None,
+                date=str(since)[:10] if since else None,
+            )
+        )
+        if len(out) >= PAST_LINES:
+            break
+    return out
+
+
 # Labels that a fail-closed or broad labeler sets on everyday facts (a rented flat → legal,
 # a place → unknown). For the user's own record that the question asks for, such a label is no
 # proof the record does not apply; health, intimate, identity documents and minors keep the
@@ -206,12 +281,14 @@ _ASKED_LABELS = (
     | Label.MONEY
 )
 _OWN = (AuthorTier.USER.value, AuthorTier.USER_CONFIRMED.value)
+# the tiers whose line names who said it (the sender of a message, a voice in the room)
+_NAMED_TIERS = (AuthorTier.OTHER.value, AuthorTier.USER_ROOM.value)
 
 
 def _own_words_hit(stems: list[str], row: dict[str, Any]) -> bool:
     """§5.5 «the item's own words», in both languages: a topic stem of the user's question
     (five letters or more) in the record's English text, its keywords, quote or value."""
-    keys = ("text", "keywords_ru", "keywords_en", "quote_orig", "value_text")
+    keys = ("text", "keywords_ru", "keywords_en", "quote_orig", "value_text", "i_quote")
     toks = set(lexical.stem(" ".join(str(row.get(k) or "") for k in keys)).split())
     long = [s for s in stems if len(s) >= 5 and not s.isdigit()]
     return any(
@@ -226,19 +303,69 @@ def _asked(
     cue: cue_mod.Cue,
     stems: list[str],
     rel_evidence: set[str] = frozenset(),  # type: ignore[assignment]
+    pets: set[str] = frozenset(),  # type: ignore[assignment]
 ) -> bool:
     """The user's own record the question asks for: through its relation, or by its named
     subject or its own words."""
     if row.get("author_tier") not in _OWN or row.get("src") is not ReadSrc.RECORD:
         return False
-    if Label(int(row.get("labels") or 0)) & policy.sensitive_mask() & ~_ASKED_LABELS:
-        return False
+    subject = row.get("subject_id") or row.get("about_entity_id")
+    # a pet's vaccination or vet visit is no person's health record
+    asked = _ASKED_LABELS | (Label.HEALTH if subject and subject in pets else Label.NONE)
+    if Label(int(row.get("labels") or 0)) & policy.sensitive_mask() & ~asked:
+        return _asks_kind(row, cue, stems, subject)
     if "relation" in ls and (row.get("id") in rel_evidence or len(ls) >= 2):
         return True
-    subject = row.get("subject_id") or row.get("about_entity_id")
     if subject and subject in cue.entity_ids:
         return True
     return _own_words_hit(stems, row)
+
+
+_VALUE_KEYS = ("value_text", "quote_orig", "i_quote", "keywords_ru", "keywords_en")
+
+
+def _asks_kind(row: dict[str, Any], cue: cue_mod.Cue, stems: list[str], subject: Any) -> bool:
+    """The user's own record under a strong label (health, documents, intimate, a minor) that
+    the question asks for exactly: the subject is the one asked about (the user, or a person
+    the question resolved to) AND the question asks the record's own relation («аллергия» →
+    allergic_to, "phone number" → has_phone) or its own value words, in either language. A
+    question that only brushes the topic, or asks about someone else, still gets nothing."""
+    if subject == "self":
+        anchored = cue.self_ref or not cue.entity_ids
+    else:
+        anchored = bool(subject) and subject in cue.entity_ids
+    if not anchored:
+        return False
+    rel = row.get("relation")
+    held = Label(int(row.get("labels") or 0)) & policy.sensitive_mask() & ~_ASKED_LABELS
+    # the relation asked is that kind only when it is the label's own kind: a minor's phone
+    # by «телефон», an allergy by «аллергия»; a ward number never rides on «где я живу»
+    kind_ok = not held & ~(Label.MINOR | Label.HEALTH) and (
+        not held & Label.HEALTH or rel in _HEALTH_RELATIONS
+    )
+    if kind_ok and rel and rel != "other" and rel in cue.relations:
+        return True
+    return _own_words_hit(stems, {k: row.get(k) for k in _VALUE_KEYS})
+
+
+_HEALTH_RELATIONS = frozenset({"allergic_to", "has_condition", "takes_medication"})
+
+
+def _pets(conn, rows: dict[str, dict[str, Any]]) -> set[str]:
+    """The pet entities among the rows' subjects."""
+    subs = sorted({str(s) for r in rows.values() if (s := r.get("subject_id"))})
+    if not subs:
+        return set()
+    try:
+        return {
+            str(x[0])
+            for x in conn.execute(
+                f"SELECT id FROM entities WHERE etype = 'pet' AND id IN ({_marks(len(subs))})",
+                subs,
+            )
+        }
+    except sqlite3.Error:
+        return set()
 
 
 def _recheck(
@@ -248,6 +375,7 @@ def _recheck(
     cue: cue_mod.Cue,
     stems: list[str],
     rel_evidence: set[str],
+    pets: set[str] = frozenset(),  # type: ignore[assignment]
 ) -> None:
     """Use-now's `own_not_applicable` judged the user's English text against the user's
     (often Russian) words; the basket holds the bilingual row and the lane that found it."""
@@ -255,13 +383,18 @@ def _recheck(
         if v.allowed or v.reason != "own_not_applicable" or i not in rows:
             continue
         row = rows[i]
-        if _asked(row, lane_of.get(i, set()), cue, stems, rel_evidence):
+        if _asked(row, lane_of.get(i, set()), cue, stems, rel_evidence, pets):
             verdicts[i] = policy.Use(
                 True,
                 "own_asked",
                 note=policy.note_for(row.get("quote_orig")),
                 hold=cue.send_turn,
             )
+
+
+# a relation whose fact, once in effect, answers another relation's question: a move made is
+# where one lives («переезжает в Пермь» answers «где он живёт»)
+_IMPLIES: dict[str, frozenset[str]] = {"moves_to": frozenset({"lives_in", "home_address"})}
 
 
 def _asks_relation(row: dict[str, Any], cue: cue_mod.Cue, day: str) -> bool:
@@ -275,6 +408,9 @@ def _asks_relation(row: dict[str, Any], cue: cue_mod.Cue, day: str) -> bool:
         return False
     if rel in cue.relations:
         return True
+    if _IMPLIES.get(rel, frozenset()) & set(cue.relations) and not cue.past:
+        a0 = row.get("valid_from")  # a move in effect by the day: where they live now
+        return not a0 or str(a0)[:10] <= day
     if cue.relations or not (row.get("value_type") and row["value_type"] in cue.value_types):
         return False
     a0, a1 = row.get("valid_from"), row.get("valid_to")
@@ -296,7 +432,7 @@ def _recheck_targets(
     (a nickname, the other script, a declined form). The topic test does not change, except
     for the open-topic labels (third-party private, unknown): their topic is the item's own
     words, and a question that asks the named subject's fact by its relation («куда Шурик
-    летит» → "Sasha is flying to Seoul") asks those words in any language."""
+    летит» → "Sasha is flying to Seoul") asks those words in any language (the pet example)."""
     if not cue.entity_ids:
         return
     redo = [
@@ -629,13 +765,81 @@ def _episodes(
     return [(eid, 0.0)], {eid: [note, "спроси одну деталь"]}
 
 
-def _vector_lane(words: str, mask: int, budget_ms: float) -> list[tuple[str, float]]:
+def _vector_evidence(hits: list[tuple[str, float]]) -> set[str]:
+    """Meaning-only hits that count as evidence: an absolute cosine anywhere in the lane, or a
+    place at the very top of the lane above a lower floor and close to its best. One
+    embedder's cosines shift with the language pair (a Russian question against an English
+    record scores lower than the same question in English), so one absolute floor loses the
+    cross-language paraphrase that the lane still ranks first."""
+    out = {i for i, s in hits if s >= VEC_FLOOR}
+    if hits:
+        best = max(s for _, s in hits)
+        top = sorted(hits, key=lambda h: -h[1])[:VEC_TOP]
+        out |= {i for i, s in top if s >= VEC_TOP_FLOOR and s >= best - VEC_TOP_MARGIN}
+    return out
+
+
+_Hits = list[tuple[str, float]]
+
+
+def _vector_lane(words: str, mask: int, budget_ms: float) -> tuple[_Hits, _Hits]:
+    """The meaning lanes: one query embedding, one scan, records and raw messages apart."""
     t0 = time.perf_counter()
     vec = vectors.embed_query(words)
     if not vec:
-        return []
+        return [], []
     left = max(5.0, budget_ms - (time.perf_counter() - t0) * 1000)
-    return vectors.search(vec, label_mask=mask, deadline_ms=left, limit=LANE_LIMIT)
+    recs, raws = vectors.search_split(
+        vec, label_mask=mask, deadline_ms=left, limit=LANE_LIMIT, raw_limit=RAW_LIMIT
+    )
+    bar = max(RAW_VEC_MIN, raws[0][1] * RAW_VEC_REL) if raws else 0.0
+    return recs, [(i, sc) for i, sc in raws if sc >= bar]
+
+
+def _raw_evidence(
+    row: dict[str, Any], ls: set[str], raw_vec: dict[str, float], name_stems: set[str]
+) -> bool:
+    """A raw message found by one raw lane is evidence on its own when its meaning is as close
+    to the question as a record's must be (`VEC_FLOOR`), or when the text hit holds one of
+    the question's proper names, in its words or as its sender, whoever wrote it. Relevance
+    only: the policy verdict was applied before (use-now)."""
+    if row.get("src") is not ReadSrc.RAW:
+        return False
+    if raw_vec.get(str(row["id"]), 0.0) >= VEC_FLOOR:
+        return True
+    if "raw" not in ls or not name_stems:
+        return False
+    said = f"{row.get('unmasked') or row.get('text') or ''} {row.get('author_name') or ''}"
+    return bool(name_stems & set(lexical.stem(said).split()))
+
+
+def _drop_learned_raws(conn, chosen: list[str], rows: dict[str, dict[str, Any]]) -> list[str]:
+    """A raw message is not shown next to chosen facts learned from it (`source_raw_id`) whose
+    quotes, shown on their lines, hold nearly all of its words (`DUP_COVER`). A raw that
+    says more than its facts quote stays, and so does a raw behind a decision or an episode
+    (their lines carry no quote), and a partly overtaken raw (its line says a value changed)."""
+    raws = [
+        i
+        for i in chosen
+        if rows[i].get("src") is ReadSrc.RAW and not isinstance(rows[i].get("past"), str)
+    ]
+    recs = [i for i in chosen if rows[i].get("src") is ReadSrc.RECORD]
+    if not raws or not recs:
+        return chosen
+    mr, mc = _marks(len(raws)), _marks(len(recs))
+    quoted: dict[str, set[str]] = {}
+    for raw_id, quote in conn.execute(
+        f"SELECT source_raw_id, quote_orig FROM facts WHERE source_raw_id IN ({mr})"
+        f" AND id IN ({mc}) AND quote_orig IS NOT NULL",
+        [*raws, *recs],
+    ):
+        quoted.setdefault(str(raw_id), set()).update(lexical.stem(quote).split())
+    dup = set()
+    for i in quoted:
+        words = set(lexical.stem(str(rows[i].get("text") or "")).split())
+        if words and len(words & quoted[i]) >= DUP_COVER * len(words):
+            dup.add(i)
+    return [i for i in chosen if i not in dup]
 
 
 # ---------------------------------------------------------------- hydration
@@ -672,7 +876,8 @@ def _source_value(row: dict[str, Any], shown: str) -> str:
         parts.append(val)
         have |= vs
     q_new = fresh(quote) if quote else set()
-    if q_new and (not parts or len(quote) <= VALUE_CHARS):  # the value first, then the user's words
+    src_q = bool(row.get("_asks_source"))  # «кто сказал …»: the user's words name who told them
+    if q_new and (not parts or len(quote) <= VALUE_CHARS or src_q):  # the value, then the user's words
         parts.append(quote)
         have |= q_new
     for kw in str(row.get("keywords_ru") or "").split(","):
@@ -680,7 +885,7 @@ def _source_value(row: dict[str, Any], shown: str) -> str:
         if any(ch.isdigit() for ch in kw) and fresh(kw):
             parts.append(kw)
             have |= set(lexical.stem(kw).split())
-    v = _clip("; ".join(parts), VALUE_CHARS, tier) if parts else ""
+    v = _clip("; ".join(parts), VALUE_CHARS * (2 if src_q else 1), tier) if parts else ""
     if v and v.strip("«»\"' ").casefold() in shown.casefold():
         return ""
     return v
@@ -712,12 +917,16 @@ _REC_SQL = (
     " f.keywords_ru, rel.cardinality, rel.value_type, f.fkind,"
     " f.keywords_en, f.quote_orig, f.value_text, i.quote_orig AS i_quote,"
     " i.about_entity_id, i.observed_at, e.span_start,"
-    " ae.display_name AS author_name, coalesce(f.text_en, i.text_en, d.chosen_text,"
+    " coalesce(ae.display_name, se.display_name) AS author_name,"
+    " coalesce(f.text_en, i.text_en, d.chosen_text,"
     " lp.text_en, ls.rule_en, c.text_en, e.summary_en) AS text"
     " FROM records r LEFT JOIN facts f ON f.id = r.id LEFT JOIN impressions i ON i.id = r.id"
     " LEFT JOIN decisions d ON d.id = r.id LEFT JOIN loops lp ON lp.id = r.id"
     " LEFT JOIN lessons ls ON ls.id = r.id LEFT JOIN criteria c ON c.id = r.id"
     " LEFT JOIN episodes e ON e.id = r.id LEFT JOIN entities ae ON ae.id = r.author_entity_id"
+    # who said it: a record minted without its author names its source raw's sender
+    " LEFT JOIN raw_chunks sr ON sr.id = f.source_raw_id AND r.author_entity_id IS NULL"
+    " AND sr.author_tier = r.author_tier LEFT JOIN entities se ON se.id = sr.author_entity_id"
     " LEFT JOIN relations rel ON rel.relation = f.relation"
     " WHERE r.id IN ({m})"
 )
@@ -854,6 +1063,12 @@ def _value_like(side: str) -> bool:
     return any(w[:1].isupper() for w in side.split() if len(w) >= 3)
 
 
+# (raw id, rev) of the user's messages that retire no value: parsed once, not on every turn.
+# Ids only, never text, so nothing forgotten stays here; a redaction bumps `rev` and the key is new.
+_NO_CONTRAST: set[tuple[str, int]] = set()
+NO_CONTRAST_CAP = 100_000
+
+
 def _later_contrasts(conn, raws: list[Any]) -> dict[str, list[tuple[str, str]]]:
     """RAW-TRUTH #2: the user's later messages that retire, by contrast («не X, а Y», "Y, not X"),
     a value an earlier raw holds, even before either is extracted. Per raw id: (side, the id of
@@ -862,16 +1077,23 @@ def _later_contrasts(conn, raws: list[Any]) -> dict[str, list[tuple[str, str]]]:
 
     if not raws:
         return {}
-    later = [
-        (str(r["id"]), r["ts"], [x for x in ledger.retired_sides(r["text"]) if _value_like(x)])
-        for r in conn.execute(
-            "SELECT id, ts, text FROM raw_chunks WHERE status = 'active' AND quarantined = 0"
-            " AND junk = 0 AND author_tier IN (?, ?) AND fts_rowid IS NOT NULL"
-            " ORDER BY fts_rowid DESC LIMIT ?",
-            (*_OWN, RECENT_RAWS),
-        )
-    ]
-    later = [x for x in later if x[2]]
+    later: list[tuple[str, Any, list[str]]] = []
+    for r in conn.execute(
+        "SELECT id, rev, ts, text FROM raw_chunks WHERE status = 'active' AND quarantined = 0"
+        " AND junk = 0 AND author_tier IN (?, ?) AND fts_rowid IS NOT NULL"
+        " ORDER BY fts_rowid DESC LIMIT ?",
+        (*_OWN, RECENT_RAWS),
+    ):
+        key = (str(r["id"]), int(r["rev"]))
+        if key in _NO_CONTRAST:
+            continue
+        sides = [x for x in ledger.retired_sides(r["text"]) if _value_like(x)]
+        if sides:
+            later.append((key[0], r["ts"], sides))
+        else:
+            if len(_NO_CONTRAST) >= NO_CONTRAST_CAP:
+                _NO_CONTRAST.clear()
+            _NO_CONTRAST.add(key)
     out: dict[str, list[tuple[str, str]]] = {}
     for r in raws:
         mine = _iso(r["ts"])
@@ -891,6 +1113,14 @@ def _cut_sides(text: str, sides: list[str]) -> str | None:
     return _mask_past(text, cuts)
 
 
+def _end_slip(row: dict[str, Any]) -> bool:
+    """A fact whose `valid_to` falls before its own `valid_from` (a range read across a year
+    or month boundary, «с 20 декабря по 5 января» → an end in the start's year): the end is a
+    reading slip, not the end of the fact, so the fact is not dropped as expired."""
+    a0, a1 = row.get("valid_from"), row.get("valid_to")
+    return bool(a0 and a1 and str(a1)[:10] < str(a0)[:10])
+
+
 def _hydrate(conn, ids: list[str], day: str) -> dict[str, dict[str, Any]]:
     """Usable rows only; a fact whose `valid_to` has passed by `day` is not current and is
     left out (the core view's notion of current)."""
@@ -903,12 +1133,17 @@ def _hydrate(conn, ids: list[str], day: str) -> dict[str, dict[str, Any]]:
         for r in conn.execute(_REC_SQL.format(m=m), chunk):
             if r["status"] not in _USABLE or not r["text"]:
                 continue
-            if not core_view.is_current(r["valid_to"], day):
+            row = {**dict(r), "src": ReadSrc.RECORD}
+            if _end_slip(row):
+                row["valid_to"] = None  # an end before its own start never ended it
+            if not core_view.is_current(row["valid_to"], day):
                 continue
-            out[r["id"]] = {**dict(r), "src": ReadSrc.RECORD}
+            out[r["id"]] = row
         raws = conn.execute(
-            "SELECT id, rev, text, author_tier, ts FROM raw_chunks"
-            f" WHERE id IN ({m}) AND status = 'active' AND quarantined = 0 AND junk = 0",
+            "SELECT ch.id, ch.rev, ch.text, ch.author_tier, ch.ts, e.display_name AS author_name"
+            " FROM raw_chunks ch LEFT JOIN entities e ON e.id = ch.author_entity_id"
+            f" WHERE ch.id IN ({m}) AND ch.status = 'active' AND ch.quarantined = 0"
+            " AND ch.junk = 0",
             chunk,
         ).fetchall()
         # raw side of forgetting: a forgotten raw, or one quoting a forgotten value, never
@@ -937,7 +1172,7 @@ def _hydrate(conn, ids: list[str], day: str) -> dict[str, dict[str, Any]]:
             out[r["id"]] = {
                 "id": r["id"], "kind": "raw", "version": r["rev"], "review": 0,
                 "author_tier": r["author_tier"], "text": text, "recorded_at": r["ts"],
-                "src": ReadSrc.RAW, "past": since,
+                "author_name": r["author_name"], "src": ReadSrc.RAW, "past": since,
                 "unmasked": r["text"] if text != r["text"] else None,
                 "corrected_by": list(dict.fromkeys(c for _, c in fixes)),
             }  # fmt: skip
@@ -1012,6 +1247,9 @@ def _item(row: dict[str, Any], use: policy.Use | None, ask: list[str] | None) ->
     ]
     if tail:
         text = f"{text} · {' · '.join(tail)}"
+    who = clean(str(row.get("_who") or ""), handles=True)
+    if who and who.casefold() not in text.casefold():
+        text = f"о ком: {who} · {text}"
     kind = row["kind"]
     past = row.get("past")
     if isinstance(past, str):  # a raw part of which a newer value or a fix overtook; the
@@ -1024,8 +1262,8 @@ def _item(row: dict[str, Any], use: policy.Use | None, ask: list[str] | None) ->
         text=text,
         author_tier=AuthorTier(tier) if tier else None,
         said_by=(
-            clean(row["author_name"], handles=True) or None
-            if tier == AuthorTier.OTHER.value and row.get("author_name")
+            clean(str(row["author_name"]), handles=True) or None
+            if tier in _NAMED_TIERS and row.get("author_name")
             else None
         ),
         date=_date(row),
@@ -1033,6 +1271,50 @@ def _item(row: dict[str, Any], use: policy.Use | None, ask: list[str] | None) ->
         review=bool(row.get("review")),
         ask=ask,
     )
+
+
+def _with_grounds(conn: sqlite3.Connection, item: Item, turn: TurnCtx, frozen: set[str]) -> Item:
+    """A decision's line carries what it rests on and what changed under it since
+    («основание: …», «больше не держится: …», «с тех пор: …»), so the brain does not argue
+    for it on a premise that moved. Named premises pass this turn's fence (policy, labels,
+    frozen); a forgotten one is never mentioned."""
+    if item.kind != "decision":
+        return item
+    from .. import justify
+
+    # a precise place rides in the tail only when the decision line itself already
+    # carries one («коворкинг на Бауманской, до школы 10 минут» - its own reasons)
+    own = conn.execute("SELECT labels FROM records WHERE id = ?", (item.id,)).fetchone()
+    place_ok = bool(Label(int(own[0] or 0)) & Label.LOCATION_PRECISE) if own else False
+
+    def allowed(ids: list[str]) -> set[str]:
+        ids = [i for i in ids if i not in frozen]
+        if not ids:
+            return set()
+        marks = ", ".join("?" for _ in ids)
+        live = {
+            str(r[0]): int(r[1] or 0)
+            for r in conn.execute(
+                f"SELECT id, labels FROM records WHERE id IN ({marks})"  # noqa: S608
+                " AND status IN ('active', 'archived')",
+                ids,
+            )
+        }
+        verdicts = policy.decide_many(conn, list(live), turn) if live else {}
+        return {
+            i
+            for i, labels in live.items()
+            if verdicts[i].allowed and (place_ok or not Label(labels) & Label.LOCATION_PRECISE)
+        }
+
+    try:
+        g = justify.grounds(conn, item.id, allowed)
+    except sqlite3.Error:
+        return item
+    if not (g.held or g.shaken):
+        return item
+    tail = justify.grounds_text(g, "ru", lambda t: _clip(t, 140, None))
+    return item.model_copy(update={"text": f"{item.text} · {tail}", "review": item.review})
 
 
 def line(item: Item) -> str:
@@ -1044,7 +1326,9 @@ def line(item: Item) -> str:
     if item.impression:
         tags.append("впечатление")
     tier = item.author_tier.value if item.author_tier else None
-    if item.said_by:
+    if item.said_by and tier == AuthorTier.USER_ROOM.value:
+        tags.append(f"сказано в комнате, со слов: {item.said_by}")
+    elif item.said_by:
         tags.append(f"со слов: {item.said_by}")
     elif tier == AuthorTier.OTHER.value:
         tags.append("со слов другого человека")
@@ -1164,7 +1448,7 @@ def assemble(conn: sqlite3.Connection, turn: TurnCtx, *, now: str | None = None)
     now = now or turn.clock or store.now()
     mask = int(policy.label_mask(turn))
     fence, fp = policy.mask_clause(turn, alias="r")
-    vec_future: Future[list[tuple[str, float]]] = _pool.submit(
+    vec_future: Future[tuple[_Hits, _Hits]] = _pool.submit(
         _vector_lane, words, mask, FINDER_DEADLINES_MS["vector"]
     )
     t_vec = time.perf_counter()
@@ -1190,7 +1474,7 @@ def assemble(conn: sqlite3.Connection, turn: TurnCtx, *, now: str | None = None)
 
     run("names", lambda: _names(conn, cue, fence, fp))
     run("lexical", lambda: lexical.search_records(conn, words, label_mask=mask, limit=LANE_LIMIT))
-    run("raw", lambda: lexical.search_raw(conn, words, label_mask=mask, limit=10))
+    run("raw", lambda: lexical.search_raw(conn, words, label_mask=mask, limit=RAW_LIMIT))
     run("fresh", lambda: _fresh_raws(conn, now, turn.turn_id))
     run("scope", lambda: _scope(conn, cue, fence, fp))
     run("relation", lambda: _relation(conn, cue, fence, fp, now[:10]))
@@ -1207,11 +1491,11 @@ def assemble(conn: sqlite3.Connection, turn: TurnCtx, *, now: str | None = None)
     t = time.perf_counter()
     try:
         wait = max(0.0, FINDER_DEADLINES_MS["vector"] / 1000 - (time.perf_counter() - t_vec))
-        lanes["vector"] = vec_future.result(timeout=wait + 0.005)
+        lanes["vector"], lanes["rawvec"] = vec_future.result(timeout=wait + 0.005)
     except FutureTimeout:
-        lanes["vector"] = []  # skipped past its deadline (§10.2)
+        lanes["vector"] = lanes["rawvec"] = []  # skipped past its deadline (§10.2)
     except Exception:  # noqa: BLE001 - a vector failure never breaks a turn
-        lanes["vector"] = []
+        lanes["vector"] = lanes["rawvec"] = []
     timings["vector_wait"] = _ms(t)
 
     seeds = cue.entity_ids + [i for n in ("names", "lexical") for i, _ in lanes.get(n, [])[:10]]
@@ -1230,21 +1514,36 @@ def assemble(conn: sqlite3.Connection, turn: TurnCtx, *, now: str | None = None)
     _retired_stems(conn, rows)
     frozen = hot_frozen(conn)
     ids = [i for i in all_ids if i in rows and i not in frozen]
+    if cue.ruled_out:  # a namesake the question does not mean: no line about them
+        out_ = set(cue.ruled_out)
+        ids = [
+            i
+            for i in ids
+            if (rows[i].get("subject_id") or rows[i].get("about_entity_id")) not in out_
+        ]
     stems = lexical.query_stems(words)
     lane_of: dict[str, set[str]] = {}
     for name, hits in lanes.items():
         for i, _ in hits:
             lane_of.setdefault(i, set()).add(name)
+    if cue.asks_source:
+        for r in rows.values():
+            r["_asks_source"] = True
+    for r in rows.values():  # same-name people both still asked: each line names its own
+        who = cue.namesakes.get(str(r.get("subject_id") or r.get("about_entity_id") or ""))
+        if who:
+            r["_who"] = who
     verdicts = policy.decide_many(conn, ids, turn) if ids else {}
     rel_evidence = {i for i, sc in lanes.get("relation", []) if sc >= REL_EVIDENCE}
-    _recheck(rows, verdicts, lane_of, cue, stems, rel_evidence)
+    _recheck(rows, verdicts, lane_of, cue, stems, rel_evidence, _pets(conn, rows))
     _recheck_targets(conn, turn, verdicts, cue, rows, now[:10])
     ids = [i for i in ids if verdicts[i].allowed]
     timings["use_now"] = _ms(t)
 
     # evidence and fusion
     t = time.perf_counter()
-    vec_score = dict(lanes.get("vector", []))
+    vec_strong = _vector_evidence(lanes.get("vector", []))
+    raw_vec = dict(lanes.get("rawvec", []))
     name_stems = lexical.name_stems(words)
     keep = set(ids)
     cands: dict[str, Cand] = {}
@@ -1265,7 +1564,8 @@ def assemble(conn: sqlite3.Connection, turn: TurnCtx, *, now: str | None = None)
             and (row.get("src") is ReadSrc.RECORD or row.get("author_tier") in _OWN)
             and _name_hit(name_stems, row)
         )
-        strong = strong or vec_score.get(i, 0.0) >= VEC_FLOOR
+        strong = strong or i in vec_strong
+        strong = strong or _raw_evidence(row, ls, raw_vec, name_stems)
         entity = row.get("subject_id") or row.get("about_entity_id")
         rel = row.get("relation")
         cands[i] = Cand(
@@ -1301,7 +1601,7 @@ def assemble(conn: sqlite3.Connection, turn: TurnCtx, *, now: str | None = None)
     t = time.perf_counter()
     items_by: dict[str, Item] = {}
     for i, _ in ranked:
-        it = _item(rows[i], verdicts.get(i), asks.get(i))
+        it = _with_grounds(conn, _item(rows[i], verdicts.get(i), asks.get(i)), turn, frozen)
         items_by[i] = it
         cands[i].line = line(it)
         cands[i].tokens = tokens(cands[i].line)
@@ -1314,7 +1614,14 @@ def assemble(conn: sqlite3.Connection, turn: TurnCtx, *, now: str | None = None)
         session_used=_session_used(conn, turn),
         blocked_goals=blocked,
     )
-    items = [items_by[i] for i in chosen]
+    items = [items_by[i] for i in _drop_learned_raws(conn, chosen, rows)]
+    try:  # a past question: the value true then, marked past (its own raw replaces a masked one)
+        past_items = _past_items(conn, turn, cue, fence, fp, frozen)
+    except sqlite3.Error:
+        past_items = []
+    if past_items:
+        pid = {p.id for p in past_items}
+        items = [i for i in items if i.id not in pid] + past_items
     timings["gate"] = _ms(t)
 
     # read set, served rows, pre-send check (§10.2 step 7, §7.4)

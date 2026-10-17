@@ -14,6 +14,10 @@ from .fusion import RRF_K
 MIN_SCORE = 1.0 / (RRF_K + 30)  # a lane rank past 30 is noise
 HIGH_SCORE = 2.0 / (RRF_K + 4)  # past the session budget: top of two lanes, or strong + more
 MAX_ITEMS = 6  # one basket; keeps the median near 300 tokens (§10.2 step 6)
+# A broad question ("how are things with the diploma", "where are we with the move") strongly
+# matches more records than one basket holds: the basket then grows with it, up to this, inside
+# the token budget; the policy, stale and served checks run on every item as before.
+MAX_ITEMS_BROAD = 10
 PER_ENTITY = 3  # one person never fills the basket
 SESSION_BUDGET = 8000
 TURN_BUDGET = 1500
@@ -56,6 +60,23 @@ def served_same_version(
     return out
 
 
+def breadth_cap(
+    ranked: list[tuple[str, float]], cands: dict[str, Cand], max_items: int = MAX_ITEMS
+) -> int:
+    """How many items this question may take: `max_items`, or as many as its candidates at
+    the high gate (top of two lanes, or strong and more) when more than that many match, so
+    a broad question gets its lines and a narrow one keeps its short basket; never past
+    MAX_ITEMS_BROAD. Association items do not widen it."""
+    high = 0
+    for item_id, score in ranked:
+        c = cands.get(item_id)
+        if c is None or c.assoc or score < HIGH_SCORE:
+            continue
+        if c.strong or len(c.lanes) >= 2:
+            high += 1
+    return min(max(max_items, high), max(max_items, MAX_ITEMS_BROAD))
+
+
 def gate(
     conn: sqlite3.Connection,
     ranked: list[tuple[str, float]],
@@ -79,6 +100,8 @@ def gate(
     slots: set[str] = set()
     per_entity: dict[str, int] = {}
     assoc_taken = False
+    if cands and max_items == MAX_ITEMS:
+        max_items = breadth_cap(ranked, cands, max_items)
     for item_id, score in ranked:
         c = cands.get(item_id)
         strong = c.strong if c else False

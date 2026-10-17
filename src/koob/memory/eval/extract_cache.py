@@ -243,7 +243,10 @@ class CachedProcessor:
             self.hits += 1
             return out
         path, ids = self.view_path(snap), canonical_view(snap)[1]
-        out = self.inner(snap)
+        from .cli_env import no_account
+
+        with no_account():  # the extractor never sees the user's account e-mail
+            out = self.inner(snap)
         self.calls += 1
         try:
             path.parent.mkdir(parents=True, exist_ok=True)

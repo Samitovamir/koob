@@ -35,7 +35,7 @@ from .observe import Inspector
 from .report import ScenarioResult, WordingResult
 from .routes import probe_route, route_tools
 from .runner import Runner
-from .schema import Expect, Probe, Scenario
+from .schema import Expect, Probe, Scenario, UserMsg
 from .sut import ApiSUT, Guarded, NotBuilt
 
 SEEN_CHANNELS = {"core", "basket", "cli_prompt", "store_tools", "update_block", "all"}
@@ -378,15 +378,34 @@ class ApiBenchSUT(ApiSUT):
         super().__init__(**kw)
         self.misses: dict[str, int] = {}
         self.admitted = 0
+        self._turn_n = 0
+        self._turn: Any = None
+
+    def _new_turn(self, wording: str) -> Any:
+        """One turn per wording, as in life: the view opens it and the tools of the same
+        wording read in it. «Откуда это?» on a chained probe then points at what the previous
+        probe's turn was shown (served before this turn), not at nothing because every wording
+        shared one turn id."""
+        from ..model import TurnCtx
+
+        self._turn_n += 1
+        self._turn = TurnCtx(
+            turn_id=f"bench-{self._turn_n}",
+            thread_id="th-main",
+            session_id="sess-bench",
+            owner_words=wording,
+        )
+        return self._turn
+
+    def tool_view(self, route: str, wording: str, turn: Any = None) -> str | None:
+        if turn is None and self._turn is not None and self._turn.owner_words == wording:
+            turn = self._turn
+        return super().tool_view(route, wording, turn)
 
     def view(self, wording: str | None) -> str:
         if wording is None:
             return ""
-        from ..model import TurnCtx
-
-        turn = TurnCtx(
-            turn_id="bench", thread_id="th-main", session_id="sess-bench", owner_words=wording
-        )
+        turn = self._new_turn(wording)
         st, parts = self.store(), []
 
         def grab(fn: Callable[[], Any]) -> Any:
@@ -467,6 +486,15 @@ class BenchRunner(Runner):
         super().__init__(*a, **kw)
         self.records: list[dict[str, Any]] = []
 
+    def _before_wording(self, p: Probe, wording: str | None) -> None:
+        """A wording that is itself the user's correction (`tag: correction`) is processed as the
+        user's turn first (fix + ingest, the event path), so the view is the one after it landed,
+        for every system alike; the probe's snapshot rollback takes it back afterwards."""
+        if p.tag == "correction" and wording:
+            self._apply(
+                UserMsg(ev="user_msg", text=wording, thread=p.thread, turn=p.turn, tag=p.tag)
+            )
+
     def _run_wording(self, p: Probe, wording: str | None, workdir: Path) -> WordingResult:
         sut: _BenchSUT = self.sut  # type: ignore[assignment]
         t0 = time.perf_counter()
@@ -476,6 +504,10 @@ class BenchRunner(Runner):
         if tool:
             text = text + "\n" + tool
         ms = (time.perf_counter() - t0) * 1000
+        if p.level == "e2e":
+            # Judged only on the brain's answer: the view is built (the answer level reads it),
+            # but the probe neither passes nor fails here and is not a memory-level record.
+            return WordingResult(wording, SKIP, skipped=["e2e-only probe"], basket_ms=ms)
         hit, stale, reasons = judge_view(p, text)
         self.records.append(
             {

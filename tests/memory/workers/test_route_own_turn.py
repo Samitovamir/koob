@@ -75,7 +75,8 @@ def test_everyday_words_get_no_label_at_arrival(text):
 @pytest.mark.parametrize(
     ("text", "bit"),
     [
-        ("Подписали договор аренды на год", Label.LEGAL),
+        ("Подписали договор с подрядчиком на год", Label.LEGAL),
+        ("Подписали договор аренды на год", Label.LEGAL | Label.MONEY),
         ("мой адрес: квартира 47, код 1290", Label.LOCATION_PRECISE),
         ("поднимайся на 7 этаж, третья дверь", Label.LOCATION_PRECISE),
         ("I'm in apt 4B, buzz twice", Label.LOCATION_PRECISE),

@@ -60,9 +60,9 @@ def test_filemem_folds_at_command_and_schedule_points(loaded):
     first = up.inputs[0]
     assert "<new_messages>" in first and "17 мая" in first  # the correction reached the model
     assert "assistant (its reply)" in first or "owner:" in first
-    # p1 comes before any fold (as for the api SUT: extraction has not run): empty notes;
-    # the memory-level probe at the end sees the folded notes
-    assert [r["tokens"] for r in res["records"] if r["probe"] == "p1"][0] == 0
+    # p1 asks after the racing summary worker is done, i.e. after its commit_after (the
+    # correction), as for every SUT: the correction's fold is already in the notes
+    assert [r["tokens"] for r in res["records"] if r["probe"] == "p1"][0] > 0
     assert [r["tokens"] for r in res["records"] if r["probe"] == "p3"][-1] > 0
 
 
@@ -118,7 +118,7 @@ def test_grade_answers_code_first_then_judge(loaded):
     rows = c.grade_answers(captured, probes, brain, judge)
     assert [r["passed"] for r in rows] == [True, False]
     assert [r["by"] for r in rows] == ["code", "judge"]
-    assert len(judged) == 1 and "forbidden" in judged[0]
+    assert len(judged) == 2 and "forbidden" in judged[1]  # every answer is judged for noise
 
 
 def test_panel_view_rules(loaded):
@@ -175,3 +175,92 @@ def test_ollama_guard(monkeypatch):
     monkeypatch.setattr(j, "swap_used_gb", lambda: 13.0)
     with pytest.raises(c.GuardAbort, match="swap"):
         c.ollama_guard("llm", http(["llm"]))
+
+
+
+
+def test_light_subset_skips_the_heavy_scenarios(loaded):
+    ids = [s.id for s in loaded.scenarios if c.is_light(s.id)]
+    assert "c1-d01" not in ids and "c1-d02" in ids and "knows-d01" in ids
+    assert not [i for i in ids if i.startswith(("c3-", "e2e-", "scout-"))]
+
+
+def test_role_call_cache_only_never_calls(tmp_path):
+    def runner(*a: Any, **kw: Any):
+        raise AssertionError("a cache-only run must not call the model")
+
+    rc = c.RoleCall("memory_filemem", _Out, "m", tmp_path, runner=runner, cache_only=True)
+    with pytest.raises(c.CacheMiss):
+        rc("abc")
+    assert rc.stats()["misses"] == 1 and rc.calls == 0
+
+
+def test_replay_processor_counts_a_miss_and_extracts_nothing(tmp_path):
+    rp = c.ReplayProcessor(tmp_path)
+    out = rp({"messages": [{"id": "m1", "text": "hello"}], "raws": []})
+    assert out == {"entities": [], "facts": [], "impressions": []}
+    assert (rp.hits, rp.misses, rp.calls) == (0, 1, 0)
+
+
+def test_graphiti_view_shows_invalidated_facts_as_history():
+    from datetime import UTC, datetime
+
+    from koob.memory.eval.matchers import shown_as_current
+
+    d = datetime(2026, 5, 1, tzinfo=UTC)
+    view = c.graphiti_view(
+        [("u1", "Denis lives in Denver", d, None), ("u2", "Denis lives in Boulder", d, d)],
+        [("Denis", "the owner")],
+    )
+    assert "FACTS (current):\n- Denis lives in Denver (since 2026-05-01)" in view
+    assert "- Denis lives in Boulder (no longer true since 2026-05-01)" in view
+    assert shown_as_current(view, "Denver") and not shown_as_current(view, "Boulder")
+
+
+def test_graphiti_budget_caps_per_scenario_and_run():
+    from koob.memory.eval import graphiti_llm as gl
+
+    b = gl.Budget(per_scenario=2, total=3)
+    b.take()
+    b.take()
+    with pytest.raises(gl.CapReached):
+        b.take()
+    assert b.exceeded and "scenario" in b.exceeded
+    b2 = gl.Budget(per_scenario=5, total=3)
+    for _ in range(3):
+        b2.take()
+    b2.new_scenario()
+    with pytest.raises(gl.CapReached):
+        b2.take()
+    assert "run cap" in (b2.exceeded or "")
+
+
+def test_subscription_llm_calls_once_caches_and_retries(tmp_path):
+    import asyncio
+
+    from graphiti_core.prompts.models import Message
+
+    from koob.memory.eval import graphiti_llm as gl
+
+    class Ent(BaseModel):
+        name: str
+
+    seen: list[dict[str, Any]] = []
+
+    def caller(**kw: Any):
+        seen.append(kw)
+        if len(seen) == 1:
+            return {"wrong": 1}, {"cost_usd": 0.01}  # does not validate: one retry
+        return {"name": "Denis"}, {"cost_usd": 0.02}
+
+    b = gl.Budget()
+    llm = gl.SubscriptionLLM(b, tmp_path, caller=caller)
+    msgs = [Message(role="system", content="extract"), Message(role="user", content="hi")]
+    out = asyncio.run(llm.generate_response(list(msgs), response_model=Ent))
+    assert out == {"name": "Denis"} and len(seen) == 2
+    assert seen[0]["quarantine"] is True and seen[0]["model"] == "claude-sonnet-5"
+    assert seen[0]["json_schema"]["properties"]["name"]["type"] == "string"
+    assert "untrusted_posting" in seen[0]["system_prompt"]
+    msgs = [Message(role="system", content="extract"), Message(role="user", content="hi")]
+    assert asyncio.run(llm.generate_response(msgs, response_model=Ent)) == {"name": "Denis"}
+    assert (b.calls, b.hits, len(seen)) == (2, 1, 2)

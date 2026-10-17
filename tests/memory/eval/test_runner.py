@@ -109,7 +109,7 @@ def test_chained_probe_runs_in_the_same_trial_per_wording():
     assert len(res.probes[1].wordings) == 2  # cycles over the parent's wordings
 
 
-def test_noise_is_replayed_in_bulk_and_scaled():
+def test_noise_is_replayed_in_full_and_scaled():
     d = scenario_dict()
     d["timeline"].insert(1, {
         "ev": "noise", "seed": 7, "count": 40, "span": {"from": "2026-01-11", "to": "2026-01-20"},

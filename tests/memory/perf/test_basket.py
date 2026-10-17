@@ -3,7 +3,8 @@
 Spec marker: `[T perf/test_basket::p95_with_embedding]`: the whole pre-turn recall (cue
 parse, finders, use-now, fusion, gate, served rows, pre-send check) ≤ 150 ms p95 on a 10^5
 record store, query embedding included. The embedder is simulated at the measured cost of
-embeddinggemma-300m (§10.3: 17.6 ms p95 per query) over a 10^5 × 768 fp16 matrix."""
+embeddinggemma-300m (§10.3: 17.6 ms p95 per query) over a 10^5 × 768 fp16 matrix, plus
+5·10^4 raw messages in both raw lanes (stemmed text and meaning rows in the same matrix)."""
 
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from koob.memory.recall import lexical, vectors
 from .._ledger import open_seeded
 
 N_RECORDS = 100_000
+N_RAWS = 50_000
 N_ENTITIES = 2_000
 N_EPISODES = 3_000
 DIM = 768
@@ -143,6 +145,25 @@ def _seed(conn) -> None:
         conn.execute(
             "INSERT INTO episode_links VALUES (?, 'participant', ?)", (eid, rnd.choice(ents[:50]))
         )
+    raws = []
+    for i in range(N_RAWS):
+        k = rnd.randrange(len(TOPIC_RU))
+        words = [rnd.choice(vocab) for _ in range(12)] + [TOPIC_RU[k], rnd.choice(NAMES)]
+        day = f"2026-{rnd.randrange(1, 11):02d}-{rnd.randrange(1, 28):02d}T10:00:00.000000Z"
+        tier = rnd.choice(("user", "other"))
+        raws.append((f"m{i:06d}", tier, day, " ".join(words), f"h-m{i}", rnd.randrange(4), day))
+    conn.executemany(
+        "INSERT INTO raw_chunks (id, source_kind, author_tier, ts, text, content_hmac, labels,"
+        " policy_version, created_at, updated_at) VALUES (?, 'chat', ?, ?, ?, ?, ?, 0, ?, 't')",
+        raws,
+    )
+    conn.executemany(
+        "INSERT INTO fts_raw (rowid, text) VALUES (?, ?)",
+        [
+            (rowid_, lexical.stem(text))
+            for rowid_, text in conn.execute("SELECT fts_rowid, text FROM raw_chunks").fetchall()
+        ],
+    )
     conn.executemany(
         "INSERT INTO served (thread_id, session_id, item_id, item_kind, version, via, created_at)"
         " VALUES (?, ?, ?, 'fact', 1, 'basket', ?)",
@@ -154,15 +175,17 @@ def _seed(conn) -> None:
 
 def _index() -> None:
     rng = np.random.default_rng(3)
-    ids = [f"r{i:06d}" for i in range(N_RECORDS)]
-    mat = rng.standard_normal((N_RECORDS, DIM)).astype(np.float16)
+    ids = sorted([f"r{i:06d}" for i in range(N_RECORDS)] + [f"m{i:06d}" for i in range(N_RAWS)])
+    n = len(ids)
+    mat = rng.standard_normal((n, DIM)).astype(np.float16)
     vectors._index[0] = vectors._Index(
         "perf@1",
         DIM,
         ids,
         mat,
-        np.zeros(N_RECORDS, np.int64),
-        np.ones(N_RECORDS, bool),
+        np.zeros(n, np.int64),
+        np.ones(n, bool),
+        np.array([i.startswith("m") for i in ids], bool),
     )
 
 

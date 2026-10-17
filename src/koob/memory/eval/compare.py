@@ -39,6 +39,15 @@ from typing import Any, Literal
 
 from pydantic import BaseModel
 
+from . import cli_env
+from .answer_level import (
+    checkout_commit,
+    format_table,
+    outcome,
+    run_label,
+    score_table,
+    stratified_sample,
+)
 from .bench import ApiBenchSUT, BenchRunner, _Api, _BenchSUT, _blocks, _stale_values, judge_view
 from .bench import summarize as bench_summarize
 from .graders import SKIP
@@ -55,8 +64,8 @@ BRAIN_MODEL = "claude-sonnet-5"
 ROLE_JUDGE = "memory_compare_judge"
 JUDGE_MODEL = "claude-sonnet-5"  # no local Qwen fits under the memory guard; a cloud model judges
 
-GRAPHITI_LLM = "gemma4:e4b"
-GRAPHITI_EMBEDDER = "bge-m3"
+GRAPHITI_LLM = "claude-sonnet-5"  # over the user's subscription (graphiti_llm), not Ollama
+GRAPHITI_LINES, GRAPHITI_CHARS = 200, 20000  # one episode per fold point (the LLM has a long context)
 OLLAMA = "http://127.0.0.1:11434"
 BIG_MODEL_BYTES = 3_000_000_000  # an embedder under this is not a "big model" for the guard
 
@@ -118,6 +127,7 @@ class AnswerOut(BaseModel):
 class VerdictOut(BaseModel):
     verdict: Literal["pass", "fail"]
     reason: str = ""
+    noisy: bool = False  # the reply drags in memory lines the message did not ask for
 
 
 # ---------------------------------------------------------------------- cached model calls
@@ -133,6 +143,10 @@ def _prompt_hash(role: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+class CacheMiss(RuntimeError):
+    pass
+
+
 class RoleCall:
     """`run_role` with an on-disk cache keyed by (role, model, prompt hash, input text)."""
 
@@ -143,8 +157,14 @@ class RoleCall:
         model: str,
         root: Path,
         runner: Callable[..., tuple[BaseModel, dict]] | None = None,
+        *,
+        cache_only: bool = False,
+        commit: str = "",
     ) -> None:
         self.role, self.out_model, self.model = role, out_model, model
+        self.commit = commit  # the checkout the system under test came from
+        self.cache_only = cache_only
+        self.misses = 0
         self.root = Path(root)
         self._runner = runner
         self.prompt = _prompt_hash(role) if runner is None else role
@@ -154,7 +174,8 @@ class RoleCall:
         self.seconds = 0.0
 
     def path(self, text: str) -> Path:
-        key = hashlib.sha256(f"{self.role}|{self.model}|{self.prompt}|{text}".encode()).hexdigest()
+        key = f"{self.role}|{self.model}|{self.prompt}|{cli_env.MODE}|{self.commit}|{text}"
+        key = hashlib.sha256(key.encode()).hexdigest()
         return self.root / self.role / f"{key[:40]}.json"
 
     def __call__(self, text: str) -> dict[str, Any]:
@@ -166,13 +187,17 @@ class RoleCall:
                 return out
             except (OSError, ValueError):
                 pass
+        if self.cache_only:
+            self.misses += 1
+            raise CacheMiss(f"{self.role}: not in the cache (cache-only run)")
         runner = self._runner
         if runner is None:
             from koob.llm.runner import run_role
 
             runner = run_role
         t0 = time.perf_counter()
-        obj, meta = runner(self.role, self.out_model, text, model=self.model, lenient=True)
+        with cli_env.no_account():  # the exam never sees the user's account e-mail
+            obj, meta = runner(self.role, self.out_model, text, model=self.model, lenient=True)
         self.seconds += time.perf_counter() - t0
         self.calls += 1
         self.cost_usd += float((meta or {}).get("cost_usd") or 0.0)
@@ -187,6 +212,7 @@ class RoleCall:
         return {
             "calls": self.calls,
             "hits": self.hits,
+            "misses": self.misses,
             "cost_usd": round(self.cost_usd, 4),
             "seconds": round(self.seconds, 1),
         }
@@ -324,14 +350,20 @@ class FileMemoryAgentSUT(_BatchSUT):
 
     name = "filemem"
 
-    def __init__(self, updater: Callable[[str], dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self, updater: Callable[[str], dict[str, Any]] | None = None, *, cache_only: bool = False
+    ) -> None:
         super().__init__()
         self.notes = ""
         if updater is None:
             from ...paths import WORKSPACE_DIR
 
             updater = RoleCall(
-                ROLE_FILEMEM, NotesOut, FILEMEM_MODEL, WORKSPACE_DIR / "cache" / "memory-compare"
+                ROLE_FILEMEM,
+                NotesOut,
+                FILEMEM_MODEL,
+                WORKSPACE_DIR / "cache" / "memory-compare",
+                cache_only=cache_only,
             )
         self.updater = updater
 
@@ -410,72 +442,62 @@ def chunk_lines(batch: list[str], max_lines: int = 30, max_chars: int = 2500) ->
 
 
 class GraphitiSUT(_BatchSUT):
-    """graphiti-core on an embedded Kuzu file; LLM and embedder on local Ollama."""
+    """graphiti-core on an embedded Kuzu file. LLM: Claude over the user's subscription
+    (`graphiti_llm.SubscriptionLLM`, capped by a shared `Budget`); embedder: our in-process
+    fastembed model. No Ollama, no API key."""
 
     name = "graphiti"
+    budget: Any = None  # one Budget for the whole run (the factory makes a SUT per scenario)
+    embedder: Any = None  # one embedder per process
 
-    def __init__(self, llm: str = GRAPHITI_LLM, embedder: str = GRAPHITI_EMBEDDER) -> None:
+    def __init__(self, llm: str = GRAPHITI_LLM) -> None:
         super().__init__()
-        self.llm, self.embedder_model = llm, embedder
+        self.llm = llm
         self.g: Any = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self.episodes = 0
-        self.llm_calls = 0
+        self.calls = 0
+        self.hits = 0
         self.aborted: str | None = None
 
     def start(self, scn: Scenario, clock: Any, scheduler: Any, workdir: Path) -> None:
         super().start(scn, clock, scheduler, workdir)
         os.environ.setdefault("GRAPHITI_TELEMETRY_ENABLED", "false")
         from graphiti_core import Graphiti
-        from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
         from graphiti_core.driver.driver import GraphProvider
         from graphiti_core.driver.kuzu_driver import KuzuDriver
-        from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
         from graphiti_core.graph_queries import get_fulltext_indices
-        from graphiti_core.llm_client.config import LLMConfig
-        from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 
-        cfg = LLMConfig(
-            api_key="ollama",  # Ollama ignores it; no cloud key anywhere
-            base_url=OLLAMA + "/v1",
-            model=self.llm,
-            small_model=self.llm,
-            temperature=0,
-        )
-        llm = OpenAIGenericClient(config=cfg, max_tokens=4096)
-        self._count_llm(llm)
+        from . import graphiti_llm as gl
+
+        cls = type(self)
+        if cls.budget is None:
+            cls.budget = gl.Budget()
+        if cls.embedder is None:
+            cls.embedder = gl.LocalEmbedder()
+        cls.budget.new_scenario()
+        self._b0 = (cls.budget.calls, cls.budget.hits)
+        cache = _repo() / ".devdata" / "compare" / "graphiti" / "llm-cache"
+        llm = gl.SubscriptionLLM(cls.budget, cache, model=self.llm)
         self.loop = asyncio.new_event_loop()
         self.g = Graphiti(
             graph_driver=KuzuDriver(db=str(workdir / "graphiti.kuzu")),
             llm_client=llm,
-            embedder=OpenAIEmbedder(
-                OpenAIEmbedderConfig(
-                    api_key="ollama",
-                    base_url=OLLAMA + "/v1",
-                    embedding_model=self.embedder_model,
-                    embedding_dim=1024,
-                )
-            ),
-            cross_encoder=OpenAIRerankerClient(config=cfg),
+            embedder=cls.embedder,
+            cross_encoder=gl.LocalReranker(cls.embedder),
         )
         # Kuzu's `build_indices_and_constraints` is a no-op: the fulltext indices are ours to make
         for q in ["INSTALL fts", "LOAD EXTENSION fts", *get_fulltext_indices(GraphProvider.KUZU)]:
             self._run(self.g.driver.execute_query(q))
-
-    def _count_llm(self, llm: Any) -> None:
-        inner = llm._generate_response  # noqa: SLF001 - count every LLM request
-
-        async def counted(*a: Any, **kw: Any) -> Any:
-            self.llm_calls += 1
-            return await inner(*a, **kw)
-
-        llm._generate_response = counted  # noqa: SLF001
 
     def _run(self, coro: Any) -> Any:
         assert self.loop is not None
         return self.loop.run_until_complete(coro)
 
     def stop(self) -> None:
+        b = type(self).budget
+        if b is not None and hasattr(self, "_b0"):
+            self.calls, self.hits = b.calls - self._b0[0], b.hits - self._b0[1]
         if self.g is not None:
             with contextlib.suppress(Exception):
                 self._run(self.g.close())
@@ -485,17 +507,12 @@ class GraphitiSUT(_BatchSUT):
             self.loop = None
 
     def ingest(self, batch: list[str]) -> None:
-        for chunk in chunk_lines(batch):
+        for chunk in chunk_lines(batch, max_lines=GRAPHITI_LINES, max_chars=GRAPHITI_CHARS):
             self._episode(chunk)
 
     def _episode(self, chunk: list[str]) -> None:
         if self.aborted:
             return
-        try:
-            ollama_guard(self.llm)
-        except GuardAbort as exc:
-            self.aborted = str(exc)
-            raise
         try:
             self._run(
                 self.g.add_episode(
@@ -511,6 +528,9 @@ class GraphitiSUT(_BatchSUT):
             self.episodes += 1
         except Exception as exc:  # noqa: BLE001 - a failed episode is lost, like in the app
             self.errors.append(f"add_episode: {type(exc).__name__}: {exc}"[:240])
+        b = type(self).budget
+        if b is not None and b.exceeded:
+            self.aborted = b.exceeded
 
     def view(self, wording: str | None) -> str:
         self.before_view()
@@ -525,7 +545,8 @@ class GraphitiSUT(_BatchSUT):
             node_similarity_search,
         )
 
-        vec = await self.g.embedder.create(input_data=[wording])
+        emb = self.g.embedder
+        vec = await (emb.query(wording) if hasattr(emb, "query") else emb.create([wording]))
         edges = await edge_similarity_search(
             self.g.driver, vec, None, None, SearchFilters(), None, 10, 0.0
         )
@@ -546,18 +567,54 @@ class GraphitiSUT(_BatchSUT):
         except Exception:  # noqa: BLE001
             pass
         nodes = await node_similarity_search(self.g.driver, vec, SearchFilters(), None, 5, 0.0)
+        return graphiti_view(facts, [(n.name, n.summary) for n in nodes])
 
-        def day(d: datetime | None) -> str:
-            return d.date().isoformat() if d else "present"
 
-        out = ["FACTS (each with its date range: valid from - invalid since):"]
-        out += [f"- {f} ({day(v) if v else '?'} - {day(i)})" for _, f, v, i in facts]
-        out += ["ENTITIES:"]
-        out += [f"- {n.name}: {n.summary}" for n in nodes]
-        return "\n".join(out)
+def graphiti_view(facts: list[tuple[Any, str, Any, Any]], nodes: list[tuple[str, str]]) -> str:
+    """Graphiti's temporal facts as the brain reads them: a fact Graphiti invalidated says so in
+    its own line («no longer true since ...»), the way any glue would present `invalid_at`."""
+
+    def day(d: Any) -> str:
+        return d.date().isoformat() if isinstance(d, datetime) else str(d)[:10]
+
+    cur = [f"- {f} (since {day(v)})" if v else f"- {f}" for _, f, v, i in facts if not i]
+    old = [f"- {f} (no longer true since {day(i)})" for _, f, _v, i in facts if i]
+    out = ["FACTS (current):", *cur]
+    if old:
+        out += ["FACTS (no longer true, history):", *old]
+    out += ["ENTITIES:", *(f"- {n}: {s}" for n, s in nodes)]
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------------- api with counters
+
+
+class ReplayProcessor:
+    """The cloud extractor from its cache only (the exam's answers, the replay's fuzzy lookup):
+    a miss makes no model call, extracts nothing and is counted."""
+
+    route = "cloud"
+    model_id = "claude-opus-5"
+
+    def __init__(self, root: Path | None = None) -> None:
+        from .extract_cache import CachedProcessor
+
+        self.cp = CachedProcessor(object(), root)
+        self.cp.model_id = self.model_id
+        self.calls = 0
+        self.hits = 0
+        self.misses = 0
+
+    def available(self) -> bool:
+        return True
+
+    def __call__(self, snap: dict[str, Any]) -> dict[str, Any]:
+        out = self.cp.lookup(snap, fuzzy=True)
+        if out is not None:
+            self.hits += 1
+            return out
+        self.misses += 1
+        return {"entities": [], "facts": [], "impressions": []}
 
 
 class ApiCompareSUT(ApiBenchSUT):
@@ -565,11 +622,13 @@ class ApiCompareSUT(ApiBenchSUT):
 
     name = "api"
 
-    def __init__(self, extract: str = "cloud", labeler: Any = True) -> None:
-        super().__init__(extract=extract, labeler=labeler)
+    def __init__(self, extract: str = "cloud", labeler: Any = True, cache_only: bool = False):
+        kw: dict[str, Any] = {"processor": ReplayProcessor()} if cache_only else {}
+        super().__init__(extract=extract, labeler=labeler, **kw)
         self.proc_s = 0.0
         self.calls = 0
         self.hits = 0
+        self.extract_misses = 0  # (`misses` is the bench's probe-miss dict)
 
     def run_worker(self, job: str, phase: str = "run", token: str | None = None) -> None:
         t0 = time.perf_counter()
@@ -582,6 +641,7 @@ class ApiCompareSUT(ApiBenchSUT):
         if self._proc is not None:
             self.calls += int(getattr(self._proc, "calls", 0))
             self.hits += int(getattr(self._proc, "hits", 0))
+            self.extract_misses += int(getattr(self._proc, "misses", 0))
         super().stop()
 
 
@@ -591,8 +651,9 @@ class ApiCompareSUT(ApiBenchSUT):
 class CompareRunner(BenchRunner):
     """BenchRunner that also keeps, for the answer set, what the brain saw and when."""
 
-    def __init__(self, *a: Any, **kw: Any) -> None:
+    def __init__(self, *a: Any, answer_set: set[tuple[str, str]] | None = None, **kw: Any) -> None:
         super().__init__(*a, **kw)
+        self.answer_set = ANSWER_SET if answer_set is None else answer_set
         self.captured: list[dict[str, Any]] = []
         self._first: set[str] = set()
 
@@ -611,11 +672,12 @@ class CompareRunner(BenchRunner):
         finally:
             sut.view = inner
         key = (self.scn.id, p.id)
-        if key in ANSWER_SET and wording and p.id not in self._first:
+        if key in self.answer_set and wording and p.id not in self._first:
             self._first.add(p.id)
             self.captured.append(
                 {
                     "scenario": self.scn.id,
+                    "group": self.scn.group,
                     "probe": p.id,
                     "guarantee": PANEL.get(key),
                     "wording": wording,
@@ -637,7 +699,17 @@ def load_compare_set(root: Path) -> LoadedSet:
     return dev
 
 
-def make_sut(name: str) -> _BenchSUT:
+# Graphiti's light subset: the scenarios with 500-11,000 noise lines are left out (each would
+# cost hundreds of LLM calls); every SUT is reported on the same subset.
+HEAVY_IDS = ("c1-d01",)
+HEAVY_PREFIXES = ("c3-", "e2e-", "scout-")
+
+
+def is_light(scenario_id: str) -> bool:
+    return scenario_id not in HEAVY_IDS and not scenario_id.startswith(HEAVY_PREFIXES)
+
+
+def make_sut(name: str, *, cache_only: bool = False) -> _BenchSUT:
     from .bench import LegacySUT, PlainFileSUT
 
     if name == "plain":
@@ -645,9 +717,9 @@ def make_sut(name: str) -> _BenchSUT:
     if name == "legacy":
         return LegacySUT(cache=True)
     if name == "api":
-        return ApiCompareSUT()  # type: ignore[return-value]
+        return ApiCompareSUT(cache_only=cache_only)  # type: ignore[return-value]
     if name == "filemem":
-        return FileMemoryAgentSUT()
+        return FileMemoryAgentSUT(cache_only=cache_only)
     if name == "graphiti":
         return GraphitiSUT()
     raise ValueError(name)
@@ -658,8 +730,11 @@ def run_compare(
     factory: Callable[[], Any],
     *,
     scenario_ids: list[str] | None = None,
+    light: bool = False,
     seed: int = 20261014,
     on_scenario: Callable[[str, dict[str, Any]], None] | None = None,
+    answer_set: set[tuple[str, str]] | None = None,
+    answer_only: bool = False,
 ) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     captured: list[dict[str, Any]] = []
@@ -672,17 +747,27 @@ def run_compare(
         "proc_s": 0.0,
         "model_calls": 0,
         "cache_hits": 0,
+        "cache_misses": 0,
         "cost_usd": 0.0,
-        "local_llm_calls": 0,
         "episodes": 0,
     }
     t0 = time.perf_counter()
     for scn in loaded.scenarios:
         if scenario_ids and scn.id not in scenario_ids:
             continue
+        if light and not is_light(scn.id):
+            continue
+        if (
+            answer_only
+            and answer_set is not None
+            and not any((scn.id, p.id) in answer_set for p in scn.probes)
+        ):
+            continue
         sut = factory()
         before = _role_stats(sut)
-        r = CompareRunner(scn, loaded.personas, sut=sut, scale="1x", seed=seed)
+        r = CompareRunner(
+            scn, loaded.personas, sut=sut, scale="1x", seed=seed, answer_set=answer_set
+        )
         res = r.run()
         after = _role_stats(sut)
         records += r.records
@@ -694,8 +779,9 @@ def run_compare(
         stats["proc_s"] += getattr(sut, "proc_s", 0.0)
         stats["model_calls"] += after["calls"] - before["calls"] + getattr(sut, "calls", 0)
         stats["cache_hits"] += after["hits"] - before["hits"] + getattr(sut, "hits", 0)
+        own = getattr(sut, "extract_misses", 0)
+        stats["cache_misses"] += after["misses"] - before["misses"] + own
         stats["cost_usd"] += after["cost_usd"] - before["cost_usd"]
-        stats["local_llm_calls"] += getattr(sut, "llm_calls", 0)
         stats["episodes"] += getattr(sut, "episodes", 0)
         errors += [f"{scn.id}: {e}" for e in getattr(sut, "errors", [])]
         if res.error:
@@ -703,7 +789,7 @@ def run_compare(
         if on_scenario:
             on_scenario(scn.id, stats)
         if getattr(sut, "aborted", None):
-            errors.append(f"memory guard abort: {sut.aborted}")
+            errors.append(f"abort: {sut.aborted}")
             break
     stats["wall_s"] = round(time.perf_counter() - t0, 1)
     stats["proc_s"] = round(stats["proc_s"], 1)
@@ -719,7 +805,8 @@ def run_compare(
 
 def merge_runs(parts: list[dict[str, Any]]) -> dict[str, Any]:
     """One run from runs over disjoint scenario lists (parallel processes): sums, wall = max."""
-    out: dict[str, Any] = {"sut": parts[0]["sut"], "records": [], "captured": [], "errors": []}
+    out: dict[str, Any] = {k: parts[0][k] for k in ("sut", "commit", "label") if k in parts[0]}
+    out |= {"records": [], "captured": [], "errors": []}
     stats: dict[str, Any] = {}
     for p in parts:
         out["records"] += p["records"]
@@ -735,8 +822,8 @@ def merge_runs(parts: list[dict[str, Any]]) -> dict[str, Any]:
 def _role_stats(sut: Any) -> dict[str, Any]:
     up = getattr(sut, "updater", None)
     if isinstance(up, RoleCall):
-        return {"calls": up.calls, "hits": up.hits, "cost_usd": up.cost_usd}
-    return {"calls": 0, "hits": 0, "cost_usd": 0.0}
+        return {"calls": up.calls, "hits": up.hits, "misses": up.misses, "cost_usd": up.cost_usd}
+    return {"calls": 0, "hits": 0, "misses": 0, "cost_usd": 0.0}
 
 
 # ---------------------------------------------------------------------- answer level
@@ -782,31 +869,43 @@ def grade_answers(
     probes: dict[tuple[str, str], Probe],
     brain: Callable[[str], dict[str, Any]],
     judge: Callable[[str], dict[str, Any]],
+    *,
+    spent: Callable[[], int] | None = None,
+    max_calls: int | None = None,
+    groups: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Brain answers each captured context; code checks first, the judge when they cannot decide."""
+    """Brain answers each captured context. The verdict comes from code checks when they can
+    decide, else from the judge; the judge also marks every answer `noisy` (it brings up memory
+    the message did not ask for), so it is called once per answer.
+    `spent` / `max_calls`: stop before the item that could pass the call cap (brain + judge)."""
     out = []
     for item in captured:
+        if max_calls is not None and spent is not None and spent() + 2 > max_calls:
+            break
         p = probes[(item["scenario"], item["probe"])]
         answer = str(brain(brain_text(item)).get("answer") or "")
         hit, stale, reasons = judge_view(p, answer)
         gold = gold_of(p)
+        v = judge(judge_text(item, answer, gold))
         if not gold["rubric"] and hit is not False and stale is not True:
             passed, by, why = True, "code", ""
         else:
-            v = judge(judge_text(item, answer, gold))
             passed, by, why = v.get("verdict") == "pass", "judge", str(v.get("reason") or "")
-        out.append(
-            {
-                **{k: item[k] for k in ("scenario", "probe", "guarantee", "wording")},
-                "answer": answer,
-                "code_hit": hit,
-                "code_stale": stale,
-                "code_reasons": reasons,
-                "passed": passed,
-                "by": by,
-                "reason": why,
-            }
-        )
+        group = item.get("group") or (groups or {}).get(item["scenario"])
+        row = {
+            **{k: item[k] for k in ("scenario", "probe", "guarantee", "wording")},
+            "group": group,
+            "answer": answer,
+            "code_hit": hit,
+            "code_stale": stale,
+            "code_reasons": reasons,
+            "passed": passed,
+            "by": by,
+            "reason": why,
+            "noisy": bool(v.get("noisy")),
+        }
+        row["class"] = outcome(row, group)
+        out.append(row)
     return out
 
 
@@ -837,6 +936,22 @@ def main(argv: list[str] | None = None) -> None:
     r.add_argument("--sut", required=True)
     r.add_argument("--out", required=True)
     r.add_argument("--scenario", action="append")
+    r.add_argument("--light", action="store_true", help="skip c1-d01, c3-*, e2e-*, scout-*")
+    r.add_argument("--seed", type=int, default=20261014)
+    r.add_argument("--cache-only", action="store_true", help="api/filemem: a miss calls nothing")
+    r.add_argument("--max-calls", type=int, help="graphiti: the run's cap on real LLM calls")
+    r.add_argument("--label", help="name of this system in the table (default sut@commit)")
+    r.add_argument(
+        "--answer-set",
+        choices=("stratified", "panel"),
+        default="stratified",
+        help="probes whose context is captured for the answer level",
+    )
+    r.add_argument("--answer-n", type=int, default=80, help="size of the stratified sample")
+    r.add_argument("--answer-seed", type=int, default=20261016)
+    r.add_argument(
+        "--answer-only", action="store_true", help="skip scenarios without a sampled probe"
+    )
     m = sub.add_parser("merge")
     m.add_argument("parts", nargs="+")
     m.add_argument("--out", required=True)
@@ -844,21 +959,45 @@ def main(argv: list[str] | None = None) -> None:
     a.add_argument("runs", nargs="+")
     a.add_argument("--cache", required=True)
     a.add_argument("--out", required=True)
+    a.add_argument("--max-calls", type=int, default=200, help="brain + judge model calls")
     args = ap.parse_args(argv)
     loaded = load_compare_set(_repo() / "evals" / "memory")
     if args.cmd == "run":
+        if args.max_calls is not None:
+            from .graphiti_llm import Budget
+
+            GraphitiSUT.budget = Budget(total=args.max_calls)
 
         def progress(sid: str, st: dict[str, Any]) -> None:
             print(
                 f"{sid}: flushes={st['flushes']} calls={st['model_calls']} "
-                f"hits={st['cache_hits']} local={st['local_llm_calls']}",
+                f"hits={st['cache_hits']} miss={st['cache_misses']} eps={st['episodes']}",
                 flush=True,
             )
 
+        picked = (
+            stratified_sample(
+                loaded.scenarios, args.answer_n, args.answer_seed, keep=set(ANSWER_SET)
+            )
+            if args.answer_set == "stratified"
+            else None
+        )
         res = run_compare(
-            loaded, lambda: make_sut(args.sut), scenario_ids=args.scenario, on_scenario=progress
+            loaded,
+            lambda: make_sut(args.sut, cache_only=args.cache_only),
+            scenario_ids=args.scenario,
+            light=args.light,
+            seed=args.seed,
+            on_scenario=progress,
+            answer_set=picked,
+            answer_only=args.answer_only,
         )
         res["sut"] = args.sut
+        res["commit"] = checkout_commit()
+        res["label"] = run_label(args.sut, res["commit"], args.label)
+        res["seed"] = args.seed
+        if GraphitiSUT.budget is not None:
+            res["stats"]["graphiti_budget"] = GraphitiSUT.budget.stats()
         Path(args.out).write_text(
             json.dumps(res, ensure_ascii=False, indent=1, default=str), encoding="utf-8"
         )
@@ -874,22 +1013,40 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
     probes = probe_index(loaded)
+    groups = {s.id: s.group for s in loaded.scenarios}
     root = Path(args.cache)
-    brain = RoleCall(ROLE_BRAIN, AnswerOut, BRAIN_MODEL, root)
-    judge = RoleCall(ROLE_JUDGE, VerdictOut, JUDGE_MODEL, root)
     report: dict[str, Any] = {}
+    calls = {"brain": [], "judge": []}
     for path in args.runs:
         run = json.loads(Path(path).read_text(encoding="utf-8"))
-        rows = grade_answers(run["captured"], probes, brain, judge)
-        report[run["sut"]] = {
+        commit = str(run.get("commit") or "")
+        label = str(run.get("label") or run_label(run["sut"], commit or "unknown"))
+        brain = RoleCall(ROLE_BRAIN, AnswerOut, BRAIN_MODEL, root, commit=commit)
+        judge = RoleCall(ROLE_JUDGE, VerdictOut, JUDGE_MODEL, root, commit=commit)
+        rows = grade_answers(
+            run["captured"],
+            probes,
+            brain,
+            judge,
+            spent=lambda b=brain, j=judge: b.calls + j.calls,
+            max_calls=args.max_calls,
+            groups=groups,
+        )
+        report[label] = {
+            "sut": run["sut"],
+            "commit": commit,
             "answers": rows,
             "panel_view": panel_view(run["captured"], probes),
         }
+        calls["brain"].append(brain.stats())
+        calls["judge"].append(judge.stats())
         n = sum(r["passed"] for r in rows)
-        print(
-            f"{run['sut']}: {n}/{len(rows)} brain={brain.stats()} judge={judge.stats()}", flush=True
-        )
-    report["calls"] = {"brain": brain.stats(), "judge": judge.stats()}
+        print(f"{label}: {n}/{len(rows)} brain={brain.stats()} judge={judge.stats()}", flush=True)
+    report["calls"] = calls
+    systems = [k for k in report if k != "calls"]
+    table = score_table({k: report[k] for k in systems})
+    report["table"] = table
+    print(format_table(table, systems))
     Path(args.out).write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
 
 

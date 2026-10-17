@@ -54,8 +54,10 @@ def test_lexicon_miss_never_reaches_cloud_stub(db):
         cloud=cloud,
         local=local,
     )
-    assert cloud.seen == ["r-plain"]
-    assert local.seen == ["r-uncertain", "r-health"]
+    # an unsure score once final is not a sensitive label: it goes where unlabeled text goes;
+    # the confident label stays local
+    assert cloud.seen == ["r-plain", "r-uncertain"]
+    assert local.seen == ["r-health"]
     assert waiting == [["r-pending"]]  # waits for its labels; never downgraded to the cloud
     # a job mixing a pending member with a plain one never goes to the cloud either
     mixed = [

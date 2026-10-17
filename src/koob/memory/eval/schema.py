@@ -588,6 +588,10 @@ class Probe(_S):
         None
     )
     ask: list[str] = Field(default_factory=list)
+    # `correction`: each wording is itself the user's correction and the scenario expects it to land;
+    # the memory-level replay (bench, compare) reads the view after that turn is processed,
+    # for every system alike. A grader hint, like user_msg `tag`: the system never sees it.
+    tag: Literal["correction"] | None = None
     expect: Expect | None = None
     expect_any: list[Expect] = Field(default_factory=list)
     budget: Budget = Field(default_factory=Budget)
@@ -618,6 +622,7 @@ class Scenario(_S):
     persona: str
     assumes: Assumes = Field(default_factory=Assumes)
     clock: ClockSpec
+    date_order: Literal["dmy", "mdy"] | None = None  # numeric dates; default: persona tz/langs
     setup: Setup = Field(default_factory=Setup)
     contacts: dict[str, Contact] = Field(default_factory=dict)
     canaries: list[Canary] = Field(default_factory=list)
