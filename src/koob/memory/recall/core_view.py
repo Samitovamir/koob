@@ -45,7 +45,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from .. import clock as _clock
-from .. import entities, ledger, policy, store
+from .. import entities, justify, ledger, policy, store
 from ..model import (
     OWNER_ENTITY_ID,
     AuthorTier,
@@ -223,6 +223,7 @@ class _Ctx:
     names: dict[str, str] = field(default_factory=dict)
     turn: TurnCtx = field(default_factory=lambda: neutral_turn())
     sensitive: Label = _TOPIC_SENSITIVE  # never in the always-on part
+    retired: dict[str, frozenset[str]] = field(default_factory=dict)  # subject -> MM-DD
 
     @property
     def today_s(self) -> str:
@@ -334,7 +335,11 @@ def _fence(ctx: _Ctx, rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
     """Use-now with the neutral turn, frozen items out, others' precise places out, and
     topic-sensitive items out even when they are the user's own."""
     rows = [
-        r for r in rows if r["id"] not in ctx.frozen and not Label(int(r["labels"])) & ctx.sensitive
+        r
+        for r in rows
+        if r["id"] not in ctx.frozen
+        and not Label(int(r["labels"])) & ctx.sensitive
+        and not (ctx.sensitive and _topic_words(ctx, r["id"]))
     ]
     if not rows:
         return []
@@ -349,6 +354,33 @@ def _fence(ctx: _Ctx, rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
     return out
 
 
+# A topic-sensitive item the classifier left unlabelled (a diagnosis, a debt, a court case, an
+# intimate matter in plain words) stays out of the always-on core all the same; the basket still
+# answers a direct question. Strong topic words only: an allergy or a rent price applies to
+# everyday turns and is not here.
+_TOPIC_WORDS = re.compile(
+    r"(?<!\w)(?:diagnos\w*|psychiatr\w*|psychotherap\w*|therapist|antidepressant\w*|chemotherap\w*"
+    r"|prescri(?:bed|ption)|depression|bipolar|adhd|hiv|std|miscarriage|pregnan\w*|ivf|rehab"
+    r"|debts?|in\s+debt|overdue\s+loan|bankrupt\w*|lawsuit|sued|court\s+case"
+    r"|arrest\w*|criminal\s+record|probation|divorc\w*|custody|sexual\w*|intimate"
+    r"|диагноз\w*|психиатр\w*|психотерапевт\w*|антидепрессант\w*|химиотерап\w*"
+    r"|депресси\w*|биполяр\w*|сдвг|вич|выкидыш\w*|беремен\w*|реабилитац\w*"
+    r"|долг(?:а|и|ов|у|ам)?|задолж\w*|просрочк\w*|банкрот\w*"
+    r"|суд(?:е|ом|ебн\w*)?|иск(?:а|ом)?|арест\w*|судимост\w*|развод\w*|опек\w*|интим\w*|секс\w*)"
+    r"(?!\w)",
+    re.IGNORECASE,
+)
+
+
+def _topic_words(ctx: _Ctx, rid: str) -> bool:
+    row = ctx.conn.execute(
+        "SELECT f.text_en, f.value_text, f.quote_orig, r.origin_quote FROM records r"
+        " LEFT JOIN facts f ON f.id = r.id WHERE r.id = ?",
+        (rid,),
+    ).fetchone()
+    return row is not None and any(_TOPIC_WORDS.search(t) for t in row if isinstance(t, str))
+
+
 def _retired_ok(ctx: _Ctx, rid: str) -> bool:
     if rid in ctx.frozen:
         return False
@@ -356,7 +388,7 @@ def _retired_ok(ctx: _Ctx, rid: str) -> bool:
     if r is None:
         return False
     labels = Label(int(r["labels"]))
-    if labels & ctx.sensitive:
+    if labels & ctx.sensitive or (ctx.sensitive and _topic_words(ctx, rid)):
         return False
     if labels & Label.LOCATION_PRECISE and r["author_tier"] not in _OWN:
         return False
@@ -496,6 +528,76 @@ def _appl(ctx: _Ctx, raw: str | None) -> list[str]:
     return out
 
 
+def _dates(*texts: Any) -> set[str]:
+    return {
+        t[-5:]
+        for x in texts
+        if isinstance(x, str) and x
+        for t in ledger.value_tokens(x)
+        if t.startswith("date:")
+    }
+
+
+_PAST_SQL = (
+    "SELECT o.id, ro.status, o.value_text, o.value_norm, o.quote_orig, o.text_en,"
+    " o.valid_from, o.valid_to FROM facts o JOIN records ro ON ro.id = o.id"
+    " WHERE o.subject_id = ? AND ro.status IN ('superseded', 'retracted')"
+)
+_NEXT_SQL = (
+    "SELECT n.value_text, n.value_norm, n.quote_orig, n.text_en, n.valid_from, n.valid_to,"
+    " rn.origin_quote FROM edges e JOIN facts n ON n.id = e.from_id"
+    " JOIN records rn ON rn.id = n.id WHERE e.to_id = ? AND e.etype = 'supersedes'"
+)
+# a day the user names on its own: «10-го», «5-е», "the 13th" (a time or a bare "at 3" is no day)
+_BARE_DAY = re.compile(r"(?<![\d:./])(\d{1,2})(?:-?го|-?е|st|nd|rd|th)(?!\w)", re.IGNORECASE)
+
+
+def _named_days(*texts: Any) -> set[int]:
+    return {
+        int(m[1])
+        for x in texts
+        if isinstance(x, str)
+        for m in _BARE_DAY.finditer(x)
+        if 1 <= int(m[1]) <= 31
+    } | {int(d[-2:]) for d in _dates(*texts)}
+
+
+def _weekday_of(mmdd: str, year: int) -> int | None:
+    try:
+        return date(year, int(mmdd[:2]), int(mmdd[3:])).weekday()
+    except ValueError:
+        return None
+
+
+def _retired_dates(ctx: _Ctx, rid: str) -> frozenset[str]:
+    """The MM-DD dates a correction retired for this record's subject.
+
+    Example: a camp's «until» after the user's «не в субботу, а в воскресенье, 10-го».
+    A date a superseded or retracted fact of the subject held is retired unless a fact that
+    superseded it holds it too, and only when the correction moved the day: it names another
+    day, or the old side of the user's contrast names that date's weekday. A time-only fix
+    (15:40, not 14:20) keeps the date."""
+    row = ctx.conn.execute("SELECT subject_id FROM facts WHERE id = ?", (rid,)).fetchone()
+    if row is None or row[0] is None:
+        return frozenset()
+    subj = str(row[0])
+    if subj not in ctx.retired:
+        gone: set[str] = set()
+        for old in ctx.conn.execute(_PAST_SQL, (subj,)).fetchall():
+            nxt = [tuple(n) for n in ctx.conn.execute(_NEXT_SQL, (old[0],))]
+            kept = {d for n in nxt for d in _dates(*n)}
+            days = {d for n in nxt for d in _named_days(*n)}
+            sides = [s for n in nxt for t in n[2:] if t for s in ledger.retired_sides(t)]
+            wds = {w for s in sides if (w := _period_weekdays(s)) and len(w) == 1}
+            year = int(str(old[6] or old[7] or ctx.today_s)[:4])
+            for d in _dates(*tuple(old)[2:]) - kept:
+                moved = bool(days) and int(d[-2:]) not in days
+                if old[1] == "retracted" or moved or frozenset({_weekday_of(d, year)}) in wds:
+                    gone.add(d)
+        ctx.retired[subj] = frozenset(gone)
+    return ctx.retired[subj]
+
+
 def _fact_text(
     ctx: _Ctx, r: sqlite3.Row, *, limit: int = _TEXT_MAX, value_max: int = _VALUE_MAX
 ) -> str:
@@ -504,10 +606,29 @@ def _fact_text(
     if r["fkind"] == "plan":
         text = f"plan: {text}"
     marks: list[str] = []
-    if r["valid_from"] and r["fkind"] == "plan":
-        marks.append(f"from {r['valid_from'][:10]}")
-    if r["valid_to"]:
-        marks.append(f"until {r['valid_to'][:10]}")
+    # a bound the record does not state itself, on a date the user's correction retired for
+    # this person, is not shown: it would present the overtaken plan's date as current
+    gone = (
+        _retired_dates(ctx, r["id"]) - _dates(r["text_en"], r["value_text"], r["quote_orig"])
+        if r["valid_from"] or r["valid_to"]
+        else frozenset()
+    )
+    # a plan resting on a day that moved: a bound taken from that day shows the new day, a
+    # day the user's words state for it is not shown as current, and the line says the day moved
+    start, end, moved = r["valid_from"], r["valid_to"], []
+    if r["fkind"] == "plan" and (start or end):
+        bounds, notes = ledger.premise_moves(ctx.conn, r["id"])
+        start, end = bounds.get("valid_from", start), bounds.get("valid_to", end)
+        for subj, day in notes:
+            who = _name(ctx, subj)
+            moved.append(
+                f"{who}'s day moved to {day}" if who and who != "you" else f"moved to {day}"
+            )
+    if start and r["fkind"] == "plan" and not _dates(start) & gone:
+        marks.append(f"from {start[:10]}")
+    if end and not _dates(end) & gone:
+        marks.append(f"until {end[:10]}")
+    marks += moved
     if r["stability"] == "one_off":
         marks.append("one-off")
     elif r["stability"] == "habit":
@@ -960,8 +1081,74 @@ def _what_changed(ctx: _Ctx) -> list[Line]:
     for r in _fence(ctx, dec):
         day = r["at"][:10]
         text = f"{day}: decided: {_short(r['chosen_text'], 200, r['author_tier'])}"
-        lines.append(Line(r["id"], text, (_ref(r),), order=(day, 2, r["id"])))
+        g = justify.grounds(conn, r["id"], lambda ids: _allowed_ids(ctx, ids))
+        refs, deps = _grounds_refs(conn, g)
+        if g.held or g.shaken:
+            text += " — " + justify.grounds_text(g, "en", lambda t: _short(t, 120))
+        lines.append(Line(r["id"], text, (_ref(r), *refs), order=(day, 2, r["id"]), deps=deps))
+    lines += _on_hold(ctx)
     return sorted(lines, key=lambda ln: ln.order, reverse=True)  # newest kept first
+
+
+def _allowed_ids(ctx: _Ctx, ids: list[str]) -> set[str]:
+    """The core's fence for the records a line names besides its own (premises)."""
+    if not ids:
+        return set()
+    marks = ", ".join("?" for _ in ids)
+    rows = ctx.conn.execute(
+        f"SELECT id, version, labels, author_tier FROM records WHERE id IN ({marks})"  # noqa: S608
+        " AND status IN ('active', 'archived')",
+        ids,
+    ).fetchall()
+    return {r["id"] for r in _fence(ctx, rows)}
+
+
+def _grounds_refs(
+    conn: sqlite3.Connection, g: justify.Grounds
+) -> tuple[tuple[ReadRef, ...], tuple[ReadRef, ...]]:
+    def refs(ids: Iterable[str]) -> tuple[ReadRef, ...]:
+        out = []
+        for i in ids:
+            v = conn.execute("SELECT version FROM records WHERE id = ?", (i,)).fetchone()
+            if v is not None:
+                out.append(ReadRef(id=i, version=int(v[0])))
+        return tuple(out)
+
+    return refs(g.refs), refs(g.deps)
+
+
+def _on_hold(ctx: _Ctx) -> list[Line]:
+    """A decision the user's correction (or a changed premise) put on hold leaves the core's plans,
+    and shows here instead: «on hold», with what changed under it, never as a current plan. The
+    held record and its retired premises are deps: they invalidate the section and never reach
+    the pre-send check."""
+    conn = ctx.conn
+    rows = conn.execute(
+        "SELECT r.id, r.version, r.updated_at, d.chosen_text, r.author_tier FROM decisions d"
+        " JOIN records r ON r.id = d.id WHERE r.status = 'needs_review' AND r.updated_at >= ?"
+        " AND EXISTS (SELECT 1 FROM justifications j WHERE j.target_record_id = r.id)",
+        (ctx.since,),
+    ).fetchall()
+    out = []
+    for r in rows:
+        if not _retired_ok(ctx, r["id"]):
+            continue
+        g = justify.grounds(conn, r["id"], lambda ids: _allowed_ids(ctx, ids))
+        if not g.shaken:
+            continue
+        refs, deps = _grounds_refs(conn, g)
+        day = str(r["updated_at"])[:10]
+        tail = justify.grounds_text(
+            justify.Grounds(changed=g.changed, broken=g.broken, since=g.since),
+            "en",
+            lambda t: _short(t, 120),
+        )
+        text = f"{day}: on hold, was decided: {_short(r['chosen_text'], 160, r['author_tier'])}"
+        lines_deps = (_ref(r), *deps)
+        out.append(
+            Line(r["id"], f"{text} — {tail}", refs, order=(day, 3, r["id"]), deps=lines_deps)
+        )
+    return out
 
 
 _BUILDERS: dict[str, Callable[[_Ctx], list[Line]]] = {

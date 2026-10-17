@@ -5,25 +5,26 @@ Spec: §5.4 (park, never downgrade), §6.3. Started from `Runtime.ensure_started
 adapter (§16.4), never from web routes.
 
 `tick(conn, clock)` runs due jobs: the urgent `safety_net` jobs first, then `extract`
-batches (and their per-group child jobs); with nothing to do it is an idle tick and builds
-vectors (`vectors.enqueue` + the `embed` runner). One extract run is snapshot → route →
+batches (and their per-group child jobs), and last `embed` (`vectors.enqueue` + the `embed`
+runner) on every tick: what this tick extracted and the raw messages that arrived since the
+last one get their vectors before the next turn, not one idle tick later (a busy stream of
+batches would otherwise keep vectors behind). One extract run is snapshot → route →
 `propose` → `store.commit`:
 
 - **Route (§5.4).** Raw labels are finalized by code first (`policy.label`, only once the
-  in-process classifier is wired; fail-closed); `policy.route` over the batch's raw
+  in-process classifier is wired, fail-closed); `policy.route` over the batch's raw
   picks the processor (cloud before local when both are allowed). No allowed processor:
   the job waits (`not_before` + 10 min) and after 7 days is `parked` with a doctor line;
   a parked job whose route allows local re-arms when a local processor appears. Never a
   downgrade.
 - **Stale (§6.3).** Each stale group gets one child job (`{parent, group, attempt}`,
   key `<parent>:<group>:<attempt>`) with a fresh snapshot that keeps only that group;
-  attempt 3 stale again → that job is `needs_attention` (one doctor line, no user-facing
-  line).
+  attempt 3 stale again → that job is `needs_attention` (one doctor line, no user line).
 - **Rejected.** A worker proposal's content rejection drops its group alone
   (`CommitResult.rejected`, store); the scheduler never retries it and writes one
   content-free audit line `extract_rejected:<reason>`.
-- **Silent.** Background learning writes no user-facing line and no feed (§6.3); doctor
-  lines are `audit` rows, which only `cb memory doctor` reads.
+- **Silent.** Background learning writes no user line and no feed (§6.3); doctor lines
+  are `audit` rows, which only `cb memory doctor` reads.
 """
 
 from __future__ import annotations
@@ -201,6 +202,76 @@ def choose(conn: sqlite3.Connection, raw_refs: list) -> tuple[Any, str | None, s
     return None, None, "no_local" if Route.LOCAL in allowed else "no_cloud"
 
 
+def split_by_route(conn: sqlite3.Connection, raw_refs: list) -> tuple[list[list], list]:
+    """Per-message routes (§5.4): a batch that no processor may take whole is cut so every
+    message that may be read somewhere now is read now, and only the ones that block wait.
+    Returns (parts that run now, the rest). Each part is routed by `policy.route` on its own
+    members, so the union rule still holds inside every part: a part never mixes the user's
+    labelled words with anyone else's text (those go apart, ours and theirs), and another
+    person's labelled text is never in a cloud part. Nothing runs now: ([], all)."""
+    from .. import policy
+    from . import extract
+
+    up = {r for r in (Route.CLOUD, Route.LOCAL) if extract.processor(r.value) is not None}
+    each = policy.route_each(conn, raw_refs)  # one load for the batch, not one per message
+    ready = [r for r in raw_refs if each.get(r.id, set()) & up]
+    if not ready:
+        return [], list(raw_refs)
+    parts: list[list] = []
+    if choose(conn, ready)[0] is not None:
+        parts = [ready]
+    else:  # the user's labelled words beside another person's text: each side on its own
+        mine = policy.ours(conn, ready)
+        for side in ([r for r in ready if r.id in mine], [r for r in ready if r.id not in mine]):
+            if side and choose(conn, side)[0] is not None:
+                parts.append(side)
+    taken = {r.id for p in parts for r in p}
+    return parts, [r for r in raw_refs if r.id not in taken]
+
+
+def _run_parts(
+    conn: sqlite3.Connection,
+    job: dict[str, Any],
+    parts: list[list],
+    rest: list,
+    clock: Clock,
+) -> str:
+    """Run the parts of a split batch now, each as its own `extract` job (its stale groups
+    retry under it); `job` keeps the rest and waits on its own clock (its park age is the
+    batch's). Returns `partial` while some of the batch waits, else `done`."""
+    payload = dict(job.get("payload") or {})
+    jkind = str(job.get("jkind") or EXTRACT)
+    rest_ids = [r.id for r in rest]
+    kids: list[str] = []
+    with store.write_tx(conn, priority="background"):
+        for part in parts:
+            ids = [r.id for r in part]
+            kid = {"raw_ids": ids, "turn_id": payload.get("turn_id"), "split_from": job["id"]}
+            kids.append(enqueue(conn, jkind, kid, idempotency_key=f"{job['id']}:route:{ids[0]}"))
+        payload["raw_ids"] = rest_ids
+        conn.execute(
+            "UPDATE jobs SET payload = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(payload), store.now(), job["id"]),
+        )
+    for kid in kids:
+        if not store.claim_job(conn, kid):
+            continue  # already run (or running) by an earlier pass over the same batch
+        child = {
+            "id": kid,
+            "jkind": jkind,
+            "payload": json.loads(
+                conn.execute("SELECT payload FROM jobs WHERE id = ?", (kid,)).fetchone()[0] or "{}"
+            ),
+        }
+        if run_batch(conn, child, clock) in ("done", "empty"):
+            _set_state(conn, kid, "done")
+    if not rest_ids:
+        return "done"
+    _, _, why = choose(conn, rest)
+    _wait(conn, {**job, "payload": payload}, why or "no_route", clock)
+    return "partial"
+
+
 def _wait(conn: sqlite3.Connection, job: dict[str, Any], why: str, clock: Clock) -> None:
     row = conn.execute("SELECT created_at FROM jobs WHERE id = ?", (job["id"],)).fetchone()
     born = _parse(row[0] if row else None) or clock.now()
@@ -242,6 +313,8 @@ def rearm_parked(conn: sqlite3.Connection, *, limit: int = 200) -> int:
         proc, _route, _why = choose(conn, refs)
         if proc is not None or (policy.route(conn, refs) and _why != payload.get("waiting_for")):
             back.append(jid)
+        elif payload.get("group") is None and split_by_route(conn, refs)[0]:
+            back.append(jid)  # some of its messages may be read now on their own
     if not back:
         return 0
     with store.write_tx(conn, priority="background"):
@@ -279,6 +352,11 @@ def run_batch(conn: sqlite3.Connection, job: dict[str, Any], clock: Clock) -> st
     raw_refs = [r for r in read_set if r.src is ReadSrc.RAW]
     proc, route, why = choose(conn, raw_refs)
     if proc is None:
+        # route per message: the clean ones are read now, only the blocking ones wait; a
+        # stale group's retry keeps its batch whole (its group ids are that batch's)
+        parts, rest = split_by_route(conn, raw_refs) if payload.get("group") is None else ([], [])
+        if parts:
+            return _run_parts(conn, job, parts, rest, clock)
         _wait(conn, job, why, clock)
         return "waiting"
     if route == Route.CLOUD.value:  # a labelled known fact never rides along to the cloud
@@ -356,7 +434,7 @@ def run_safety_net(conn: sqlite3.Connection, job: dict[str, Any]) -> None:
         if outcome == "waiting":
             _set_state(conn, job["id"], "failed")
             return
-        if outcome != "needs_attention":
+        if outcome not in ("needs_attention", "partial"):  # a partial batch waits for its rest
             _set_state(conn, jid, "done")
 
 
@@ -378,12 +456,17 @@ def tick(conn: sqlite3.Connection, clock: Clock) -> int:
         register()
         rearm_parked(conn)
         ran = store.run_queued_jobs(conn, SAFETY) + store.run_queued_jobs(conn, EXTRACT)
-        if ran == 0:  # idle tick: vectors for what changed
-            try:
-                from ..recall import vectors
+        return ran + embed(conn)
 
-                vectors.enqueue(conn)
-                ran += store.run_queued_jobs(conn, EMBED)
-            except Exception:  # noqa: BLE001 - no embedder here: the idle work waits
-                pass
-        return ran
+
+def embed(conn: sqlite3.Connection) -> int:
+    """Vectors for every record and raw message that changed since the last pass (one pull
+    job; nothing to do costs one scan). Background only: the turn never embeds. Returns the
+    jobs run (0 when no embedder is available: the work waits for the next tick)."""
+    try:
+        from ..recall import vectors
+
+        vectors.enqueue(conn)
+        return store.run_queued_jobs(conn, EMBED)
+    except Exception:  # noqa: BLE001 - no embedder here: the work waits
+        return 0

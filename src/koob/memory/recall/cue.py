@@ -36,6 +36,9 @@ class Cue(BaseModel):
     value_types: list[str] = Field(default_factory=list)  # where → place, when → date, …
     self_ref: bool = False  # first person («я», «мы», «my»): the user's own facts are the subject
     past: bool = False  # «был», «жила», «раньше», «used to»: the answer is not a plan
+    asks_source: bool = False  # «кто сказал», "who told me": the answer is who said it
+    ruled_out: list[str] = Field(default_factory=list)  # namesakes the question does not mean
+    namesakes: dict[str, str] = Field(default_factory=dict)  # same-name people still asked
 
 
 # ---------------------------------------------------------------- dates
@@ -243,7 +246,79 @@ def _names(conn: sqlite3.Connection | None, text: str) -> dict[str, float]:
         hits = lexical.search_names(conn, text, limit=8)
     except sqlite3.Error:
         return {}
-    return {eid: s for eid, s in hits if s >= NAME_FLOOR and eid != "self"}
+    names = {eid: s for eid, s in hits if s >= NAME_FLOOR and eid != "self"}
+    try:
+        for eid in _possessive_names(conn, text):
+            names[eid] = max(names.get(eid, 0.0), POSSESSIVE_SCORE)
+    except sqlite3.Error:
+        pass
+    try:
+        for eid, s in _same_full_name(conn, names).items():
+            names.setdefault(eid, s)
+    except sqlite3.Error:
+        pass
+    return names
+
+
+# A Russian possessive adjective made from a first name («Лерин отпуск», «Костиной школе»,
+# «мамин день рождения») is the name's stem + -ин/-ын + an adjective ending; trigrams of
+# «костиной» never meet «костя». The stem with a first-declension nominative ending («кост» →
+# «костя», «лер» → «лера») is looked up as an exact first word of a stored alias only.
+_POSSESSIVE = re.compile(r"^([а-яё]{2,}?)(?:ин|ын)(?:|а|о|у|ы|ой|ого|ому|ым|ых|ыми|ую|ом|ою)$")
+POSSESSIVE_SCORE = 0.95
+
+
+def _possessive_names(conn: sqlite3.Connection, text: str) -> list[str]:
+    noms: list[str] = []
+    for tok in re.findall(r"[а-яё]+", text.casefold()):
+        m = _POSSESSIVE.match(tok)
+        if m:
+            noms += [m.group(1) + end for end in ("а", "я") if m.group(1) + end not in noms]
+    out: list[str] = []
+    for nom in noms[:6]:
+        for (eid,) in conn.execute(
+            "SELECT DISTINCT a.entity_id FROM aliases a JOIN records r ON r.id = a.entity_id"
+            " WHERE (a.alias_norm = ? OR (a.alias_norm > ? AND a.alias_norm < ?))"
+            " AND r.status IN ('active', 'archived') LIMIT 4",
+            (nom, nom + " ", nom + "!"),
+        ):
+            if eid != "self" and eid not in out:
+                out.append(eid)
+    return out
+
+
+def _same_full_name(conn: sqlite3.Connection, names: dict[str, float]) -> dict[str, float]:
+    """One person minted as several entities (a contact saved under a nickname, plus a chat
+    member with the same full name in Latin script): a person the question resolved to brings
+    the other person entities under the same full name, in either script, at the same score. A
+    full name has two words or more, so a bare first name joins nobody. Read side only."""
+    from .. import entities
+
+    if not names:
+        return {}
+    ids = list(names)
+    keys: dict[str, float] = {}
+    for eid, name in conn.execute(
+        f"SELECT id, display_name FROM entities WHERE etype = 'person' AND id IN ({policy._in(len(ids))})",  # noqa: S608, E501
+        ids,
+    ):
+        norm = entities.normalize_alias(str(name or ""))
+        if len(norm.split()) < 2:
+            continue
+        for k in {norm, *(entities.normalize_alias(t) for t in entities.transliterations(norm))}:
+            keys[k] = max(keys.get(k, 0.0), names[eid])
+    if not keys:
+        return {}
+    out: dict[str, float] = {}
+    for eid, k in conn.execute(
+        "SELECT a.entity_id, a.alias_norm FROM aliases a JOIN entities e ON e.id = a.entity_id"
+        " WHERE e.etype = 'person' AND a.kind IN ('name', 'translit')"
+        f" AND a.alias_norm IN ({policy._in(len(keys))})",  # noqa: S608
+        list(keys),
+    ):
+        if eid not in names and eid != "self":
+            out[eid] = max(out.get(eid, 0.0), keys[k])
+    return out
 
 
 def _topics(ws: list[str]) -> list[str]:
@@ -251,7 +326,7 @@ def _topics(ws: list[str]) -> list[str]:
     return [n for i, n in enumerate(LABEL_NAMES) if hit & (1 << i)]
 
 
-# ---------------------------------------------------------------- relations
+# ---------------------------------------------------------------- relations (the pet example)
 # A natural question names what it asks for by a relation word («где живёшь», «брат», «кот»,
 # «работаешь») and by its question word (where, when, who). These lexicons map such words,
 # Russian and English, to the relation vocabulary of config/memory/relations.yaml, so the
@@ -366,6 +441,14 @@ _PAST_LEX = policy._lex(
     "=был|=была|=было|=были|=жил|=жила|=жили|снимал|раньше|прежн|прошл|до переезда",
     "=was|=were|=lived|used to|=before|previous|former",
 )
+# «кто сказал», «от кого узнал», "who told me", "according to": the question asks who said a
+# thing, so its lines keep the words that name the sender or the relative behind the claim
+_SOURCE_LEX = policy._lex(
+    "кто сказал|кто говорил|кто рассказ|кто писал|кто написал|кто сообщ|кто передал|от кого"
+    "|с чьих слов|чьи слова|по чьим словам|откуда я знаю|откуда ты знаешь|где я слышал",
+    "who told|who said|who mentioned|who wrote|who texted|who messaged|who says|heard it from"
+    "|heard that from|according to whom|whose words|where did i hear|where'd i hear",
+)
 # the relations through which a relation word names the user's person or pet («мой брат»)
 _KIN = frozenset(
     (
@@ -413,9 +496,240 @@ def _kin_entities(conn: sqlite3.Connection | None, rels: list[str]) -> list[str]
             " ORDER BY r.recorded_at DESC LIMIT 4",
             kin,
         ).fetchall()
+        # the same link written from the other side ("X is my sister" → X sibling_of the
+        # user): the person is the fact's subject
+        rows += conn.execute(
+            "SELECT DISTINCT f.subject_id FROM facts f JOIN records r ON r.id = f.id"
+            f" WHERE f.value_entity_id = 'self' AND f.relation IN ({marks})"  # noqa: S608
+            " AND f.subject_id IS NOT NULL AND r.status = 'active'"
+            " ORDER BY r.recorded_at DESC LIMIT 4",
+            kin,
+        ).fetchall()
+        if not rows and "has_pet" in kin:
+            # «кот», "the dog" with no has-pet fact: the pets the user's own active facts are about
+            rows = conn.execute(
+                "SELECT DISTINCT f.subject_id FROM facts f JOIN records r ON r.id = f.id"
+                " JOIN entities e ON e.id = f.subject_id WHERE e.etype = 'pet'"
+                " AND r.status = 'active' AND r.author_tier IN ('user', 'user_confirmed')"
+                " ORDER BY r.recorded_at DESC LIMIT 4"
+            ).fetchall()
     except sqlite3.Error:
         return []
-    return [r[0] for r in rows if r[0] and r[0] != "self"]
+    return list(dict.fromkeys(r[0] for r in rows if r[0] and r[0] != "self"))
+
+
+# a person named by a role or a kin word the relation table has no slot for («тётя»,
+# «научрук», "landlord", "coach"), in either language: (question lexicon, the role's words in
+# both languages, looked up in the user's own active facts that link a person)
+_ROLES: tuple[tuple[policy.Lexicon, tuple[str, ...]], ...] = tuple(
+    (policy._lex(*q), terms)
+    for q, terms in (
+        (("бабушк|бабул|=grandma|grandmother|granny",), ("grandmother", "grandma", "бабушк")),
+        (("дедушк|=дед|=деда|=деду|=grandpa|grandfather",), ("grandfather", "grandpa", "дедушк")),
+        (("=тетя|=тети|=тете|=тетю|=тетей|тетушк|=aunt|auntie",), ("aunt", "тет")),
+        (("=дядя|=дяди|=дяде|=дядю|=дядей|=uncle",), ("uncle", "дяд")),
+        (("двоюродн|=кузен|=кузина|=кузины|cousin",), ("cousin", "двоюродн", "кузен", "кузин")),
+        (("племянн|nephew|=niece",), ("nephew", "niece", "племянн")),
+        (
+            ("=теща|=тещи|=тесть|=тестя|свекров|=свекор|=свекра|=зять|невестк|in-law",),
+            ("in-law", "тещ", "тест", "свекр", "зят", "невестк"),
+        ),
+        (("крестн|godmother|godfather",), ("godmother", "godfather", "крестн")),
+        (("=сосед|=соседа|=соседу|=соседи|соседк|neighbo",), ("neighbo", "сосед")),
+        (
+            ("арендодат|хозяин квартиры|хозяйка квартиры|landlord|landlady",),
+            ("landlord", "landlady", "арендодат", "хозя"),
+        ),
+        (
+            ("научрук|научный руковод|научного руковод|advisor|adviser|supervisor",),
+            ("advisor", "adviser", "supervisor", "научрук", "руковод"),
+        ),
+        (
+            ("преподава|=препод|учител|профессор|репетитор|teacher|professor|lecturer|tutor",),
+            ("teacher", "professor", "lecturer", "tutor", "instructor", "преподав", "учител"),
+        ),
+        (("тренер|=coach|trainer",), ("coach", "trainer", "тренер")),
+        (("наставн|mentor",), ("mentor", "наставн")),
+        (
+            ("одногрупп|однокурс|однокласс|classmate|groupmate",),
+            ("classmate", "groupmate", "однокурс", "одногрупп", "однокласс"),
+        ),
+        (
+            ("сосед по комнате|соседка по комнате|roommate|flatmate|housemate",),
+            ("roommate", "flatmate", "housemate"),
+        ),
+        (
+            ("начальн|руковод|=шеф|=босс|=boss|manager|team lead|тимлид",),
+            ("boss", "manager", "team lead", "начальн", "руковод", "тимлид"),
+        ),
+        (("=няня|=няни|=няне|=nanny|babysitter",), ("nanny", "babysitter", "нян")),
+    )
+)
+_ROLE_TEXT = (
+    "(coalesce(f.text_en, '') || ' ' || coalesce(f.keywords_en, '') || ' ' ||"
+    " coalesce(f.keywords_ru, '') || ' ' || coalesce(f.quote_orig, ''))"
+)
+
+
+def _like_forms(term: str) -> list[str]:
+    """LIKE folds ASCII case only: a Cyrillic word start also as capitalised and with «ё»."""
+    forms = {term, term.capitalize()}
+    for i, ch in enumerate(term):
+        if ch == "е":
+            forms |= {(t[:i] + "ё" + t[i + 1 :]) for t in (term, term.capitalize())}
+    return sorted(forms)
+
+
+def _role_entities(conn: sqlite3.Connection | None, ws: list[str]) -> list[str]:
+    """«моя тётя», "my landlord": the people the user's own active facts call by that role
+    (the role's word as a word start in a fact's text, keywords or the user's quote; either
+    language)."""
+    terms = list(dict.fromkeys(t for lex, ts in _ROLES if policy._hits(ws, lex) for t in ts))
+    if conn is None or not terms:
+        return []
+    starts = re.compile("(?:^|[^0-9a-zа-я])(?:" + "|".join(map(re.escape, terms)) + ")")
+    pats = [f"%{f}%" for t in terms for f in _like_forms(t)]
+    likes = " OR ".join(f"{_ROLE_TEXT} LIKE ?" for _ in pats)
+    try:
+        rows = conn.execute(
+            f"SELECT f.subject_id, f.value_entity_id, {_ROLE_TEXT} FROM facts f"  # noqa: S608
+            " JOIN records r ON r.id = f.id WHERE r.status = 'active'"
+            f" AND r.author_tier IN ('user', 'user_confirmed') AND ({likes})"
+            " ORDER BY r.recorded_at DESC LIMIT 60",
+            pats,
+        ).fetchall()
+        out: list[str] = []
+        for subj, val, text in rows:
+            if not starts.search(str(text or "").casefold().replace("ё", "е")):
+                continue
+            out += [str(e) for e in (subj, val) if e and e != "self" and e not in out]
+        if not out:
+            return []
+        people = {
+            r[0]
+            for r in conn.execute(
+                f"SELECT id FROM entities WHERE etype = 'person' AND id IN ({policy._in(len(out))})",  # noqa: S608, E501
+                out,
+            )
+        }
+    except sqlite3.Error:
+        return []
+    return [e for e in out if e in people][:4]
+
+
+_ABOUT_SQL = (
+    "SELECT coalesce(f.text_en, '') || ' ' || coalesce(f.keywords_ru, '') || ' ' ||"
+    " coalesce(f.keywords_en, '') || ' ' || coalesce(f.quote_orig, '') FROM facts f"
+    " JOIN records r ON r.id = f.id WHERE (f.subject_id = ? OR f.value_entity_id = ?)"
+    " AND r.status = 'active' UNION ALL SELECT coalesce(i.text_en, '') || ' ' ||"
+    " coalesce(i.quote_orig, '') FROM impressions i JOIN records r ON r.id = i.id"
+    " WHERE i.about_entity_id = ? AND r.status = 'active' LIMIT 60"
+)
+
+
+def _tell_namesakes(
+    conn: sqlite3.Connection, text: str, names: dict[str, float], kin: list[str]
+) -> tuple[dict[str, float], dict[str, str]]:
+    """Two people under one first name (e.g. the user's own contact and a namesake from a chat)
+    are told apart before anything is served about either: the question keeps only the ones
+    it points at, by a name word only they carry (a surname, a nickname), by a kin or role
+    word that links the user to them, or by its other words in what is known about them.
+    When nothing points at one of them, all stay, returned as id → full name so that each
+    line about them names whom it is about."""
+    from .. import entities
+
+    ids = list(names)
+    try:
+        people = {
+            str(r[0]): str(r[1] or "")
+            for r in conn.execute(
+                f"SELECT id, display_name FROM entities WHERE etype = 'person' AND id IN ({policy._in(len(ids))})",  # noqa: S608, E501
+                ids,
+            )
+        }
+        groups = entities.namesake_groups(people)
+        if not groups:
+            return names, {}
+        out = dict(names)
+        standing: dict[str, str] = {}
+        ws = policy.words(text)
+        for group in groups:
+            keep = _pick_namesakes(conn, text, ws, group, people, kin)
+            if len(keep) > 1:
+                standing.update({e: people[e] for e in keep})
+            for e in group:
+                if e in keep:
+                    continue
+                for x in list(out):  # the dropped one and its twins under the same full name
+                    if x == e or (
+                        x not in keep and entities.same_person_names(people.get(x), people[e])
+                    ):
+                        out.pop(x, None)
+        return (out, standing) if out else (names, {})
+    except sqlite3.Error:
+        return names, {}
+
+
+def _pick_namesakes(
+    conn: sqlite3.Connection,
+    text: str,
+    ws: list[str],
+    group: list[str],
+    people: dict[str, str],
+    kin: list[str],
+) -> set[str]:
+    from .. import entities
+    from . import lexical
+
+    first = set().union(*(entities.first_name_keys(people[e]) for e in group))
+
+    def first_word(w: str) -> bool:
+        return bool(entities.first_name_keys(w) & first) or any(
+            policy._name_token_match(k, w) for k in first if len(k) >= 3
+        )
+
+    own: dict[str, set[str]] = {e: set() for e in group}
+    for eid, alias in conn.execute(
+        f"SELECT entity_id, alias_norm FROM aliases WHERE entity_id IN ({policy._in(len(group))})",  # noqa: S608
+        group,
+    ):
+        own[str(eid)] |= set(str(alias or "").split())
+    for e in group:
+        own[e] |= set(entities.normalize_alias(people[e]).split())
+        own[e] = {t.rstrip(".") for t in own[e] if len(t) >= 3 and not first_word(t)}
+    others = [w for w in ws if not first_word(w)]
+    # 1. a name word only some of them carry
+    named = {
+        e for e in group if any(policy._name_token_match(t, w) for t in own[e] for w in others)
+    }
+    if named and len(named) < len(group):
+        return named
+    # 2. a kin or role word that links the user to some of them ("my sister")
+    linked = set(group) & set(kin)
+    if linked and len(linked) < len(group):
+        return linked
+    # 3. the question's other words in what is known about each one
+    name_like = set().union(*own.values())
+    stems = [
+        s
+        for s in lexical.query_stems(" ".join(others))
+        if len(s) >= 4 and not s.isdigit() and s not in name_like
+    ]
+    if not stems:
+        return set(group)
+    score: dict[str, int] = {}
+    for e in group:
+        toks = set(
+            lexical.stem(" ".join(str(r[0]) for r in conn.execute(_ABOUT_SQL, (e, e, e)))).split()
+        )
+        score[e] = sum(
+            1
+            for s in stems
+            if s in toks or (len(s) >= 5 and any(t.startswith(s) for t in toks if len(t) >= 5))
+        )
+    best = max(score.values())
+    top = {e for e, v in score.items() if v == best}
+    return top if best > 0 and len(top) == 1 else set(group)
 
 
 def parse(turn: TurnCtx, *, now: str, conn: sqlite3.Connection | None = None) -> Cue:
@@ -426,10 +740,17 @@ def parse(turn: TurnCtx, *, now: str, conn: sqlite3.Connection | None = None) ->
         text = ""
     names = _names(conn, text)
     ws = policy.words(text) if text else []
-    # a cause clause («из-за поездки», «потому что я улетал») is context, not what the user asks
+    # a cause clause («из-за поездки», «потому что я улетал») is context, not what is asked
     rels = relations_of(policy.words(_CAUSE.sub(" ", text.casefold()))) if text else []
-    for eid in _kin_entities(conn, rels):
+    kin = _kin_entities(conn, rels) + (_role_entities(conn, ws) if text else [])
+    for eid in kin:
         names.setdefault(eid, KIN_SCORE)
+    ruled_out: list[str] = []
+    namesakes: dict[str, str] = {}
+    if conn is not None and len(names) > 1:
+        told, namesakes = _tell_namesakes(conn, text, names, kin)
+        ruled_out = sorted(set(names) - set(told))
+        names = told
     ids = sorted(names, key=lambda e: (-names[e], e))
     past = policy._hits(ws, _PAST_LEX)
     dates = parse_dates(text, now=now, ahead=not past) if text else []
@@ -456,4 +777,7 @@ def parse(turn: TurnCtx, *, now: str, conn: sqlite3.Connection | None = None) ->
         value_types=value_types_of(ws),
         self_ref=policy._hits(ws, _SELF_LEX),
         past=past,
+        asks_source=bool(text) and policy._hits(ws, _SOURCE_LEX),
+        ruled_out=ruled_out,
+        namesakes=namesakes,
     )

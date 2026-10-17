@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import lru_cache
-from typing import Any
+from typing import Any, Literal
 
 _WS = re.compile(r"\s+")
 
@@ -25,14 +28,98 @@ def normalize(text: str) -> str:
     return _WS.sub(" ", t).strip()
 
 
+_CLAUSE_END = re.compile(r"[.!?;…](?=\s|$)")
+_ENUM = re.compile(r"(?:^|(?<=\s))\d{1,2}$")  # "1) first, 2) second": a list marker
+
+
+class Emoticon:
+    """A bracket emoticon (")", ":)", "((") matched only as an emoticon: a ")" that closes a
+    bracket opened earlier in the same clause, a "(" that a later ")" in the clause closes, or a
+    list marker "1)" is punctuation, not a smile (README: Matching). Same interface as a
+    compiled pattern for `search` / `finditer`."""
+
+    def __init__(self, token: str) -> None:
+        self.token = token
+        self.pattern = re.escape(token)
+        self._re = re.compile(self.pattern)
+        self.closing = len(token) - len(token.rstrip(")"))
+        self.opening = len(token) - len(token.lstrip("("))
+
+    def _real(self, text: str, m: re.Match[str]) -> bool:
+        i, j = m.start(), m.end()
+        lo = max((c.end() for c in _CLAUSE_END.finditer(text, 0, i)), default=0)
+        hi = next((c.start() for c in _CLAUSE_END.finditer(text, j)), len(text))
+        if self.closing:
+            run_end = j
+            while run_end < len(text) and text[run_end] == ")":
+                run_end += 1
+            run_start = j - self.closing
+            before = text[lo:run_start]
+            if self.closing == len(self.token) and _ENUM.search(before):
+                return False
+            open_n = max(0, before.count("(") - before.count(")"))
+            if (run_end - run_start) - open_n < self.closing:
+                return False
+        if self.opening:
+            run_start = i
+            while run_start > lo and text[run_start - 1] == "(":
+                run_start -= 1
+            after = text[i + self.opening : hi]
+            close_n = max(0, after.count(")") - after.count("("))
+            if (i + self.opening - run_start) - close_n < self.opening:
+                return False
+        return True
+
+    def finditer(
+        self, text: str, pos: int = 0, endpos: int | None = None
+    ) -> Iterator[re.Match[str]]:
+        end = len(text) if endpos is None else endpos
+        return (m for m in self._re.finditer(text, pos, end) if self._real(text, m))
+
+    def search(self, text: str, pos: int = 0, endpos: int | None = None) -> re.Match[str] | None:
+        return next(iter(self.finditer(text, pos, endpos)), None)
+
+
+def _is_emoticon(t: str) -> bool:
+    return bool(t) and not re.search(r"\w", t) and any(c in t for c in "()")
+
+
 @lru_cache(maxsize=4096)
-def _compile(alt_key: str, kind: str) -> tuple[re.Pattern[str], ...]:
+def _compile(alt_key: str, kind: str) -> tuple[Any, ...]:
     if kind == "str":
-        return (re.compile(re.escape(normalize(alt_key))),)
+        t = normalize(alt_key)
+        return (Emoticon(t),) if _is_emoticon(t) else (re.compile(re.escape(t)),)
     raise AssertionError(kind)
 
 
-def _date_patterns(value: str) -> list[str]:
+# A numeric date reads by the scenario's locale (README: Matching): "11/3" is November 3 in a US
+# scenario and 11 March in a Russian one. The runner sets the order for the scenario it runs
+# (persona tz/langs or the scenario's `date_order`), the same for every SUT; with no order set
+# both readings count.
+DateOrder = Literal["dmy", "mdy"]
+DATE_ORDER: ContextVar[DateOrder | None] = ContextVar("memory_eval_date_order", default=None)
+US_ZONES = ("America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles", "America/Phoenix", "America/Anchorage", "America/Detroit", "America/Boise", "America/Indiana/", "America/Kentucky/", "America/North_Dakota/", "America/Juneau", "America/Adak", "America/Menominee", "America/Nome", "America/Sitka", "America/Yakutat", "America/Metlakatla", "Pacific/Honolulu", "US/")  # fmt: skip
+
+
+def locale_date_order(tz: str | None, langs: list[str] | None) -> DateOrder | None:
+    """mdy for an English (or unknown-language) speaker in a US zone, dmy for any other known
+    speaker, None (both readings) when nothing is known."""
+    primary = (langs or [None])[0]
+    if primary in (None, "en") and tz and tz.startswith(US_ZONES):
+        return "mdy"
+    return "dmy" if primary else None
+
+
+@contextmanager
+def date_order(order: DateOrder | None) -> Iterator[None]:
+    token = DATE_ORDER.set(order)
+    try:
+        yield
+    finally:
+        DATE_ORDER.reset(token)
+
+
+def _date_patterns(value: str, order: DateOrder | None = None) -> list[str]:
     value = str(value)
     m = re.fullmatch(r"(?:(\d{4})-|--)(\d{2})-(\d{2})", value)
     if not m:
@@ -44,18 +131,26 @@ def _date_patterns(value: str) -> list[str]:
     mon_alt = "|".join(
         sorted(re.escape(x).replace(r"\\.", r"\.") if "\\" not in x else x for x in months)
     )
+    # A range names both its days: «3–5 июня», "3 to 5 June", «со 2 по 9 января» name the start
+    # day (the month follows the end day); "June 3–5" names the end day (the month leads).
+    to = r"\s*(?:[-–—]|(?<=\s)(?:по|и|to|and|through)(?=\s))\s*"
     pats = [
         rf"{day}\s*(?:{mon_alt})",
         rf"(?:{mon_alt})\s*{day}",
-        rf"{day}\s*[./]\s*0?{mo}(?!\d)",
-        rf"(?<!\d)0?{mo}\s*[/]\s*{day}",
+        rf"{day}{to}\d{{1,2}}(?!\d)\s*(?:{mon_alt})",
+        rf"(?:{mon_alt})\s*(?<!\d)\d{{1,2}}{to}{day}",
     ]
+    if order != "mdy":  # 17.05, 17/05: day first
+        pats.append(rf"{day}\s*[./]\s*0?{mo}(?!\d)")
+    if order != "dmy":  # 5/17: month first (US)
+        pats.append(rf"(?<!\d)0?{mo}\s*[/]\s*{day}")
     if year:
         y = year
-        pats += [
-            rf"{y}-0?{mo}-0?{d}(?!\d)",
-            rf"{day}\s*[./]\s*0?{mo}\s*[./]\s*(?:{y}|{y[2:]})(?!\d)",
-        ]
+        pats.append(rf"{y}-0?{mo}-0?{d}(?!\d)")
+        if order != "mdy":
+            pats.append(rf"{day}\s*[./]\s*0?{mo}\s*[./]\s*(?:{y}|{y[2:]})(?!\d)")
+        if order == "mdy":
+            pats.append(rf"(?<!\d)0?{mo}\s*/\s*{day}\s*/\s*(?:{y}|{y[2:]})(?!\d)")
     else:
         pats += [rf"(?<!\d)(?:\d{{4}}-)?0?{mo}-0?{d}(?!\d)"]
     return pats
@@ -151,9 +246,11 @@ def _time_patterns(value: str) -> list[str]:
 
 
 @lru_cache(maxsize=2048)
-def _typed(kind: str, a: str, b: str) -> tuple[re.Pattern[str], ...]:
+def _typed(
+    kind: str, a: str, b: str, order: DateOrder | None = None
+) -> tuple[re.Pattern[str], ...]:
     if kind == "date":
-        pats = _date_patterns(a)
+        pats = _date_patterns(a, order)
     elif kind == "money":
         pats = _money_patterns(a, b or None)
     else:
@@ -171,7 +268,8 @@ def compile_value(v: Any) -> list[re.Pattern[str]]:
     if isinstance(v, dict):
         for kind in ("date", "money", "time"):
             if kind in v:
-                return list(_typed(kind, str(v[kind]), str(v.get("cur") or "")))
+                order = DATE_ORDER.get() if kind == "date" else None
+                return list(_typed(kind, str(v[kind]), str(v.get("cur") or ""), order))
         raise ValueError(f"bad typed matcher {v!r}")
     return list(_compile(str(v), "str"))
 
@@ -213,8 +311,16 @@ _TAIL = r"[^\w\s]*$"  # «, $, an opening quote between the frame and the value
 _WORDS = r"((?:[^\s,;:—–-]+\s+){0,3})"  # a short frame: no comma, no dash
 _DIRECT = re.compile(rf"(?<!\w)({_NEG}|\w+n['’]t)\s+(?:{_FILL}\s+){{0,2}}{_TAIL}")
 _DOUBLE = re.compile(r"(?<!\w)(?:не|not|no|never)\s+$")
+# «не хочет без кинзы», "doesn't want it without cilantro": a negated verb before «без» affirms it
+_DOUBLE_WITHOUT = re.compile(r"(?<!\w)(?:не|not|never|\w+n['’]t)\s+(?:[^\s,;:—–-]+\s+){1,2}$")
 _CEASE = re.compile(rf"(?<!\w)(?:(?:больше|уже)\s+не|no longer)\s+{_WORDS}{_TAIL}")
 _NOT_ANYMORE = re.compile(rf"(?<!\w)(?:not|never|\w+n['’]t)\s+{_WORDS}{_TAIL}")
+# A negated want frames the value as refused ("does not want cilantro", "doesn't want to eat
+# cilantro", «не хочет кинзу», «не хочу сегодня кинзу»), with the same short frame and flip rule.
+_NOT_WANT = re.compile(
+    rf"(?<!\w)(?:не\s+(?:хоч|хот)\w*|(?:does|do|did|would|will)\s+not\s+(?:want|wish)\w*|\w+n['’]t\s+(?:want|wish)\w*|not\s+want\w*)\s+{_WORDS}{_TAIL}"
+)
+_INNER_NEG = re.compile(r"(?<!\w)(?:не|без|нет|no|not|without|never)(?!\w)")
 _ANYMORE = re.compile(r"\s*,?\s*any\s?more\b")
 _NEG_AFTER = re.compile(r"\s*[,—–-]?\s*(?:(?:уже|больше)\s+нет|no longer|not any\s?more)\b")
 _FLIP = ("забы", "забуд", "пропус", "пропуск", "избега", "отказ", "теря", "игнор", "forget", "miss", "skip", "avoid", "ignor", "lose", "drop", "omit", "neglect", "refus")  # fmt: skip
@@ -232,13 +338,19 @@ def _negated(clause: str, m: re.Match[str]) -> bool:
     before = before[: _WORD_HEAD.search(before).start()]  # a value that starts mid-word
     pos = max(0, len(before) - 120)
     d = _DIRECT.search(before, pos)
-    if d and not _DOUBLE.search(before, 0, d.start()):
+    if (
+        d
+        and not _DOUBLE.search(before, 0, d.start())
+        and not (d.group(1) in ("без", "without") and _DOUBLE_WITHOUT.search(before, 0, d.start()))
+    ):
         return True
-    for frame in (_CEASE, _NOT_ANYMORE):
+    for frame in (_CEASE, _NOT_WANT, _NOT_ANYMORE):
         f = frame.search(before, pos)
         if not f or any(k in f.group(1) for k in _FLIP):
             continue
-        if frame is _CEASE:
+        if frame is _NOT_WANT and _INNER_NEG.search(f.group(1)):
+            continue  # «не хочет без кинзы»: a negated negation affirms it
+        if frame is not _NOT_ANYMORE:
             return True
         after = clause[m.end() :]
         if _ANYMORE.match(after, _WORD_REST.match(after).end()):

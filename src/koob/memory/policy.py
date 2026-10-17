@@ -1,4 +1,4 @@
-"""Memory policy: admit, process routing, use now, chat modes, never-store, label inheritance.
+"""G1 policy: admit, process routing, use now, chat modes, never-store, label inheritance.
 
 Spec: §2 (pipeline order), §5.1-§5.6.
 Order is normative: admit -> store -> process with an allowed model -> use now -> rank.
@@ -7,9 +7,10 @@ Order is normative: admit -> store -> process with an allowed model -> use now -
   nothing else. Never-store spans (secrets, passwords, keys, one-time codes, full card and bank
   numbers) never enter memory or a model: the chunk is dropped, or, in the user's own words,
   only the span becomes «[secret removed]».
-- **Process** (§5.4): `route(read_set)` names the processors a job may use. The user's own
-  words (`user` / `user_confirmed`) count as unlabeled; other people's chats and files follow
-  the table; the cloud needs `labels_final`.
+- **Process** (§5.4): `route(read_set)` names the processors a job may use. The user's own words
+  (`user` / `user_confirmed`) count as unlabeled; other people's chats and files follow the
+  table, where the uncertain band alone (`unknown_sensitive`, no confident label) counts as
+  unlabeled too; the cloud needs `labels_final`.
 - **Use now** (§5.5): the user's own items are used wherever they apply, with a one-line note
   («учёл: аллергия на орехи»), never a card or a question gate. The direct-question rule binds
   only sensitive items from other people, chats and files. On a send turn sensitive items (and
@@ -206,6 +207,9 @@ _STRONG: dict[Label, Lexicon] = {
         "финанс|потрат|=трата|=траты|стипенд|пенси|money|salary|=debt|=debts|=loan|=loans",
         "=bank|banking|payment|=pay|=paid|budget|=tax|=taxes|invest|saving|income|expense",
         "=owe|=owes|=price|=cost|dollar|tuition|scholarship",
+        # rent and housing payments are money (they only add the label: privacy recall)
+        "аренд|квартплат|коммуналк|=жкх|=rent|=rents|=rented|=renting|rental|=utilities",
+        "utility bill|mortgage",
     ),
     Label.IDENTITY_DOCS: _lex(
         "паспорт|загранпаспорт|=виза|=визу|=визы|=визе|=визой|снилс|=инн|удостоверени",
@@ -1035,6 +1039,19 @@ def _entity_names(conn: sqlite3.Connection, entity_ids: Iterable[str]) -> list[s
 # ---------------------------------------------------------------- process routes (§5.4)
 
 
+def _route_labels(labels: Label, final: bool) -> Label:
+    """The labels a route is read from. Final labels that are only the uncertain band
+    (`unknown_sensitive` with no named label and no reserved bit: the classifier scored in
+    [LOW, HIGH) or a lexicon hit was weak, and nothing was confident) route as unlabeled, so
+    anyone's message the classifier is unsure about is read where the user's own words are. A
+    confident label, with or without the uncertain bit beside it, or a reserved bit keeps the
+    table (local only by default). Before the labelling pass the bit is the lexicon floor's
+    fail-closed guess and keeps the table too; the cloud needs final labels anyway."""
+    if final and int(labels) == int(Label.UNKNOWN_SENSITIVE):
+        return Label.NONE
+    return labels
+
+
 def _routes_for(labels: Label) -> set[Route]:
     table = routing_table()
     if not labels:
@@ -1053,11 +1070,12 @@ def route(conn: sqlite3.Connection, read_set: list[ReadRef]) -> set[Route]:
     labels_final. An empty set means the job waits (then parks), never downgrades.
 
     The user's own words (`user` / `user_confirmed`) count as unlabeled whatever their labels,
-    also beside the Cube's own `system` text (its reply in a clean turn): there only the Cube's
-    labels follow the table, so a plain reply never pulls their words local. A job with anyone
-    else's text follows the table on every member's labels (their words give the context
-    another person's reply is read in). A missing or unusable member allows nothing
-    (fail-closed)."""
+    also beside the Cube's own `system` text (its reply in a clean turn): there only the
+    Cube's labels follow the table, so a plain reply never pulls the user's words local. A job
+    with anyone else's text follows the table on every member's labels (the user's words give
+    the context another person's reply is read in). A final union that is only the uncertain
+    band routes as unlabeled (`_route_labels`); a confident label on any member keeps the
+    whole job on the table. A missing or unusable member allows nothing (fail-closed)."""
     if not read_set:
         return _routes_for(Label.NONE)
     found = _load(conn, [r.id for r in read_set])
@@ -1068,10 +1086,35 @@ def route(conn: sqlite3.Connection, read_set: list[ReadRef]) -> set[Route]:
     # The UNION of the labels picks the route (§5.4), not the intersection of per-member
     # routes: a HEALTH row next to a plain one is a HEALTH job (local), never a park.
     union = inherit([m.labels for m in members if not (ours and m.own)])
-    allowed = set(_routes_for(union))
-    if not all(m.final for m in members if m is not None):
+    final = all(m.final for m in members)
+    allowed = set(_routes_for(_route_labels(union, final)))
+    if not final:
         allowed.discard(Route.CLOUD)  # the cloud never does the labelling
     return allowed
+
+
+def route_each(conn: sqlite3.Connection, read_set: list[ReadRef]) -> dict[str, set[Route]]:
+    """`route(conn, [ref])` for every member, from one load: each message's own route."""
+    found = _load(conn, [r.id for r in read_set])
+    out: dict[str, set[Route]] = {}
+    for r in read_set:
+        m = found.get(r.id)
+        if m is None or not m.usable:
+            out[r.id] = set()
+            continue
+        allowed = set(_routes_for(Label.NONE if m.own else _route_labels(m.labels, m.final)))
+        if not m.final:
+            allowed.discard(Route.CLOUD)
+        out[r.id] = allowed
+    return out
+
+
+def ours(conn: sqlite3.Connection, read_set: list[ReadRef]) -> set[str]:
+    """The members `route` reads as ours: the user's own words and the Cube's own text. A
+    per-message split (scheduler) keeps them apart from anyone else's text, so the union rule
+    above still decides every part a processor reads."""
+    found = _load(conn, [r.id for r in read_set])
+    return {i for i, m in found.items() if m.own or m.system}
 
 
 # ---------------------------------------------------------------- use now (§5.5)

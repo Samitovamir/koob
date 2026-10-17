@@ -38,8 +38,9 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from . import ledger, store
@@ -584,6 +585,189 @@ def night_step(night: Any) -> dict[str, int]:
     revived = sum(1 for rid in pending if rederive(conn, rid))
     jobs = store.run_queued_jobs(conn, CASCADE_JOB) + store.run_queued_jobs(conn, REDERIVE_JOB)
     return {"cascade_flipped": flipped, "rederived": revived, "cascade_jobs": jobs}
+
+
+# ---------------------------------------------------------------- what a conclusion rests on (views)
+
+# A conclusion travels with the facts it rests on. The views (core, basket) show a decision
+# with its premises, and when a premise was corrected or changed since, say so next to it
+# («no longer holds because …»), so the brain never offers the old conclusion as current.
+_NUM = re.compile(r"\d+(?:[.,]\d+)?")
+_UNIT = re.compile(r"[^\W\d_]{3,}")
+_GONE = (Status.FORGOTTEN.value, Status.PURGED.value)
+_SINCE_CAP = 2
+
+
+@dataclass(frozen=True)
+class Grounds:
+    """What a conclusion rests on, for display. Texts are raw (renderers clean them); `refs`
+    are the usable records the texts name, `deps` the retired premises (never shown)."""
+
+    held: tuple[tuple[str, str, bool], ...] = ()  # (id, text, review flag)
+    changed: tuple[tuple[str, str | None], ...] = ()  # (retired premise, its successor's text)
+    broken: tuple[str, ...] = ()  # premises withdrawn or on hold, no successor to show
+    since: tuple[tuple[str, str], ...] = ()  # newer facts on a premise's slot or measure
+    refs: tuple[str, ...] = ()
+    deps: tuple[str, ...] = ()
+
+    @property
+    def shaken(self) -> bool:
+        """A premise was corrected, withdrawn or changed since: the conclusion may not hold."""
+        return bool(self.changed or self.broken or self.since)
+
+
+def _rec_text(conn: sqlite3.Connection, rid: str) -> str | None:
+    row = conn.execute(
+        "SELECT coalesce(f.text_en, d.chosen_text, r.origin_quote) FROM records r"
+        " LEFT JOIN facts f ON f.id = r.id LEFT JOIN decisions d ON d.id = r.id WHERE r.id = ?",
+        (rid,),
+    ).fetchone()
+    return str(row[0]) if row and row[0] else None
+
+
+def _head(conn: sqlite3.Connection, rid: str, seen: set[str] | None = None) -> str | None:
+    """The usable end of a premise's supersession chain (None: withdrawn or forgotten)."""
+    seen = seen or set()
+    for succ in _successors(conn, rid):
+        if succ in seen:
+            continue
+        seen.add(succ)
+        st = _status(conn, succ)
+        if st == ("record", Status.ACTIVE.value):
+            return _head(conn, succ, seen) or succ
+        if st is not None and st[1] == Status.SUPERSEDED.value:
+            got = _head(conn, succ, seen)
+            if got:
+                return got
+    return None
+
+
+def _measure(text: str | None) -> tuple[set[str], set[str]]:
+    t = (text or "").casefold()
+    return set(_NUM.findall(t)), set(_UNIT.findall(_NUM.sub(" ", t)))
+
+
+def _newer_on_slot(conn: sqlite3.Connection, premise: str, after: str, skip: set[str]) -> list[str]:
+    """Active facts recorded after the conclusion that move a premise's value: the same
+    subject and relation with another value, or (a free-form relation) the same subject and
+    the same measure (a shared unit word) with another number («6 тысяч» → «12 тысяч»)."""
+    row = conn.execute(
+        "SELECT subject_id, relation, value_norm FROM facts WHERE id = ?", (premise,)
+    ).fetchone()
+    if row is None or not row[0]:
+        return []
+    subj, rel, val = row[0], row[1] or "other", row[2]
+    nums, units = _measure(val)
+    out = []
+    for rid, rel2, val2 in conn.execute(
+        "SELECT r.id, f.relation, f.value_norm FROM facts f JOIN records r ON r.id = f.id"
+        " WHERE f.subject_id = ? AND r.status = 'active' AND r.recorded_at > ? AND r.id != ?"
+        " ORDER BY r.recorded_at DESC, r.id LIMIT 20",
+        (subj, after, premise),
+    ):
+        if rid in skip or not val2 or val2 == val:
+            continue
+        if rel != "other" and rel2 == rel:
+            out.append(str(rid))
+            continue
+        n2, u2 = _measure(val2)
+        if nums and n2 and n2 != nums and units & u2:
+            out.append(str(rid))
+    return out
+
+
+def grounds(
+    conn: sqlite3.Connection, record_id: str, allowed: Callable[[list[str]], set[str]]
+) -> Grounds:
+    """The premises of `record_id` (its justification members that are records) as they stand
+    now. `allowed(ids)` is the view's own fence (policy, labels, frozen): a premise or
+    successor it refuses is not named; a forgotten one is never mentioned at all."""
+    rows = conn.execute(
+        "SELECT DISTINCT j.member_record_id, r.status, r.review FROM justifications j"
+        " JOIN records r ON r.id = j.member_record_id WHERE j.target_record_id = ?"
+        " AND r.kind != 'entity' ORDER BY j.group_no, j.member_record_id",
+        (record_id,),
+    ).fetchall()
+    rows = [r for r in rows if r[1] not in _GONE]
+    if not rows:
+        return Grounds()
+    at = conn.execute("SELECT recorded_at FROM records WHERE id = ?", (record_id,)).fetchone()
+    heads = {str(m): _head(conn, str(m)) for m, st, _ in rows if st == Status.SUPERSEDED.value}
+    members = [str(m) for m, _, _ in rows]
+    newer = {
+        m: _newer_on_slot(conn, m, str(at[0]) if at else "", set(members))
+        for m, st, _ in ((str(a), b, c) for a, b, c in rows)
+        if st in _USABLE
+    }
+    ok = allowed(
+        list(dict.fromkeys([*members, *(h for h in heads.values() if h)]
+                           + [x for xs in newer.values() for x in xs]))
+    )  # fmt: skip
+    held: list[tuple[str, str, bool]] = []
+    changed: list[tuple[str, str | None]] = []
+    broken: list[str] = []
+    since: list[tuple[str, str]] = []
+    refs: list[str] = []
+    deps: list[str] = []
+    for m, st, review in ((str(a), b, bool(c)) for a, b, c in rows):
+        if st in _USABLE:
+            text = _rec_text(conn, m) if m in ok else None
+            if text:
+                held.append((m, text, review))
+                refs.append(m)
+            for n in newer.get(m, []):
+                t2 = _rec_text(conn, n) if n in ok else None
+                if t2 and len(since) < _SINCE_CAP and n not in refs:
+                    since.append((n, t2))
+                    refs.append(n)
+            continue
+        deps.append(m)
+        h = heads.get(m)
+        if st == Status.SUPERSEDED.value and h:
+            t2 = _rec_text(conn, h) if h in ok else None
+            changed.append((m, t2))
+            if t2:
+                refs.append(h)
+        elif st == Status.SUPERSEDED.value:
+            changed.append((m, None))
+        else:  # retracted, needs_review: withdrawn or itself on hold
+            broken.append(m)
+    return Grounds(
+        tuple(held), tuple(changed), tuple(broken), tuple(since),
+        tuple(dict.fromkeys(refs)), tuple(dict.fromkeys(deps)),
+    )  # fmt: skip
+
+
+_WORDS = {
+    "en": {
+        "because": "because", "changed": "no longer holds: a premise was corrected",
+        "now": "now", "broken": "no longer holds: a premise was withdrawn",
+        "since": "since then", "recheck": "re-check before relying on it",
+    },
+    "ru": {
+        "because": "основание", "changed": "больше не держится: основание исправлено",
+        "now": "теперь", "broken": "больше не держится: основание снято",
+        "since": "с тех пор", "recheck": "проверить, прежде чем опираться",
+    },
+}  # fmt: skip
+
+
+def grounds_text(g: Grounds, lang: str, short: Callable[[str], str]) -> str:
+    """One tail for a conclusion's line: its premises, then what changed under it."""
+    w = _WORDS["ru" if lang == "ru" else "en"]
+    parts = []
+    held = [f"«{short(t)}»" for _, t, _ in g.held]
+    if held:
+        parts.append(f"{w['because']}: {'; '.join(held)}")
+    for _, new in g.changed:
+        parts.append(f"{w['changed']}, {w['now']} «{short(new)}»" if new else w["changed"])
+    if g.broken:
+        parts.append(w["broken"])
+    if g.since:
+        parts.append(f"{w['since']}: {'; '.join(f'«{short(t)}»' for _, t in g.since)}")
+    if g.shaken:
+        parts.append(w["recheck"])
+    return " · ".join(parts) if lang == "ru" else "; ".join(parts)
 
 
 def install() -> None:

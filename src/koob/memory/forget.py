@@ -722,6 +722,101 @@ def _minted_only(
     return out
 
 
+def _quote_of(conn: sqlite3.Connection, rid: str) -> str | None:
+    """The words a record was minted from: its kind row's `quote_orig`, else the header's."""
+    row = conn.execute("SELECT kind, origin_quote FROM records WHERE id = ?", (rid,)).fetchone()
+    if row is None:
+        return None
+    if _KIND_TABLE.get(row[0]) in ("facts", "impressions"):
+        q = conn.execute(
+            f"SELECT quote_orig FROM {_KIND_TABLE[row[0]]} WHERE id = ?",  # noqa: S608
+            (rid,),
+        ).fetchone()
+        if q is not None and q[0] and str(q[0]).strip():
+            return str(q[0])
+    return str(row[1]) if row[1] and str(row[1]).strip() else None
+
+
+def _anchors(conn: sqlite3.Connection, rid: str) -> set[str]:
+    """The entities a record is about or names (subject, value, speaker, about, links)."""
+    out = {
+        r[0]
+        for r in conn.execute(
+            "SELECT subject_id FROM facts WHERE id = ?1 UNION SELECT value_entity_id FROM facts"
+            " WHERE id = ?1 UNION SELECT about_entity_id FROM impressions WHERE id = ?1"
+            " UNION SELECT target_id FROM episode_links WHERE episode_id = ?1"
+            " UNION SELECT to_id FROM edges WHERE from_id = ?1 AND etype = 'about'",
+            (rid,),
+        )
+        if r[0]
+    }
+    return out - {OWNER_ENTITY_ID}
+
+
+def _gist(conn: sqlite3.Connection, rid: str) -> set[str]:
+    """Content stems of a record's own text (English line, main text, value), names out."""
+    kind = _record_kind(conn, rid)
+    table = _KIND_TABLE.get(kind)
+    texts: list[str] = []
+    if table == "facts":
+        row = conn.execute(
+            "SELECT text_en, value_text FROM facts WHERE id = ?", (rid,)
+        ).fetchone()  # fmt: skip
+        texts = [str(v) for v in row or () if v]
+    elif table in _MAIN_TEXT:
+        row = conn.execute(
+            f"SELECT {_MAIN_TEXT[table]} FROM {table} WHERE id = ?",  # noqa: S608
+            (rid,),
+        ).fetchone()
+        texts = [str(row[0])] if row and row[0] else []
+    if not texts:
+        texts = [_quote_of(conn, rid) or ""]
+    names = set(_stems(" ".join(_aliases_of(conn, _anchors(conn, rid)))))
+    return set(_stems(" ".join(texts))) - names
+
+
+def _same_words(conn: sqlite3.Connection, recs: set[str]) -> set[str]:
+    """The records of another kind minted from the same words of the same message as a
+    forgotten one (the episode, decision, impression or intention next to the fact): one
+    statement is one memory in several kinds, so they are retired at once. Words elsewhere in
+    that message are another statement and stay; so does a record of the same kind (another
+    fact: a copy of the same one goes by `_fact_closure`), one about other people only, and
+    one whose own text says something else, even when the extractor quoted the whole message
+    for both (another person's unrelated record is never touched)."""
+    out: set[str] = set()
+    family = {"preference": "fact"}
+    for rid in sorted(recs):
+        quote = _quote_of(conn, rid)
+        if not quote:
+            continue
+        kind = _record_kind(conn, rid)
+        mine = _anchors(conn, rid)
+        gist = _gist(conn, rid)
+        for raw_id in sorted(_lineage_raw(conn, rid)):
+            row = conn.execute("SELECT text FROM raw_chunks WHERE id = ?", (raw_id,)).fetchone()
+            span = _locate(row[0], quote) if row is not None and row[0] else None
+            if span is None:
+                continue
+            for other in sorted(_usable(conn, _raw_users(conn, raw_id)) - recs - out):
+                o_kind = _record_kind(conn, other)
+                if o_kind == "entity" or family.get(o_kind, o_kind) == family.get(kind, kind):
+                    continue  # names follow by `_minted_only`, never by a shared quote
+                o_span = _locate(row[0], _quote_of(conn, other) or "")
+                if o_span is None:
+                    continue
+                common = min(span[1], o_span[1]) - max(span[0], o_span[0])
+                if common <= 0 or common < 0.5 * min(span[1] - span[0], o_span[1] - o_span[0]):
+                    continue
+                theirs = _anchors(conn, other)
+                if mine and theirs and not mine & theirs:
+                    continue
+                o_gist = _gist(conn, other)
+                if gist and o_gist and len(gist & o_gist) < 0.5 * min(len(gist), len(o_gist)):
+                    continue
+                out.add(other)
+    return out
+
+
 def _names_entity(conn: sqlite3.Connection, eid: str) -> set[str]:
     """Records that name an entity: as subject, speaker or value, an impression about it, or
     an episode linked to it."""
@@ -985,6 +1080,8 @@ def _plan(
         conn, "SELECT id FROM records WHERE id IN ({qs}) AND status NOT IN ('forgotten', 'purged')",
         extra_records,
     )  # fmt: skip
+    if scope is not ForgetScope.CHAT:  # the same words in another kind are the same memory
+        recs |= _same_words(conn, recs)
     direct = set(recs)  # raw follows these; records built from them follow by cascade
     recs = _cascade_derived_records(conn, recs)
     terms, stable = _x_terms(conn, xs)
@@ -3172,7 +3269,8 @@ def blocked_by(
 ) -> str | None:
     """The commit-side check for ledger's applier, workers and builders: the forget_id
     whose suppression an op would undo, or None. An op is admitted only as the user's new
-    word: `user`/`user_confirmed` tier from a source newer than the forget (§9.6)."""
+    word: `user`/`user_confirmed` tier from a source newer than the forget (§9.6) that is not
+    itself an order to forget or cancel (`_order_at`)."""
     fam = family if family is not None else _family(conn, relation)
     val = value_norm or ""
     cand: list[str] = []
@@ -3188,10 +3286,26 @@ def blocked_by(
         "ORDER BY created_at DESC",
         cand,
     ).fetchall():
-        if tier in _USER_TIERS and source_ts is not None and source_ts > created:
+        new_word = tier in _USER_TIERS and source_ts is not None and source_ts > created
+        if new_word and not _order_at(conn, str(source_ts)):
             continue
         return fid
     return None
+
+
+def _order_at(conn: sqlite3.Connection, ts: str) -> bool:
+    """The user's message at `ts` is itself an order to forget or cancel («выкинь из головы,
+    что …»). What it repeats of the forgotten value is the order, never the user's new word,
+    so the extraction of the «забудь» turn cannot bring the value back."""
+    from .recall import safe_text
+
+    return any(
+        safe_text.order_kind(text) is not None
+        for (text,) in conn.execute(
+            "SELECT text FROM raw_chunks WHERE ts = ? AND author_tier IN ('user', 'user_confirmed')",
+            (ts,),
+        )
+    )
 
 
 # ---------------------------------------------------------------- read paths

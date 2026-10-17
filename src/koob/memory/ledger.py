@@ -38,6 +38,7 @@ import re
 import sqlite3
 import time
 from collections.abc import Callable, Iterable, Sequence
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,7 @@ import yaml
 
 from . import entities, store
 from .model import (
+    OWNER_ENTITY_ID,
     AliasKind,
     AnyRecord,
     AuthorTier,
@@ -718,10 +720,14 @@ def _matches(a: dict[str, Any], c: dict[str, Any]) -> bool:
     """§8.3: does assertion A restate C's slot so that A supersedes C?"""
     if c["stability"] == "one_off" or _plan_class(a["fkind"]) != _plan_class(c["fkind"]):
         return False
-    if _scope(a["applicability"]) != _scope(c["applicability"]) or _older(a, c):
+    if _older(a, c) or not _may_supersede_rows(a, c):
         return False
-    if not _may_supersede_rows(a, c):
-        return False
+    lapse = _lapses(a, c)
+    sa, sc = _scope(a["applicability"]), _scope(c["applicability"])
+    if sa != sc and not (lapse and not sa and not {"for_whom", "audience"} & set(sc)):
+        return False  # the user's general «больше не» covers the user's own scoped instances, never others'
+    if lapse:
+        return True
     va, vc = _value_key(a), _value_key(c)
     if va is None or vc is None:
         return False
@@ -734,7 +740,76 @@ def _matches(a: dict[str, Any], c: dict[str, Any]) -> bool:
     if a["cardinality"] == "single":
         return True
     quote = a["quote_orig"] or a["origin_quote"] or ""
-    return bool(_CUE.search(quote))
+    if not _CUE.search(quote):
+        return False
+    # A partial change supersedes only the part that changed: a multi slot whose new word
+    # names what it replaces («вместо тенниса», "not X but Y") retires only that value, and an
+    # added one («теперь ещё и бассейн», "now I also swim") retires none.
+    sides = _replaced_sides(quote)
+    if sides:
+        return any(holds_value(x, _value_text(c)) or _named_by(x, _value_text(c)) for x in sides)
+    return not _ADDED.search(quote)
+
+
+# «больше не» / "no longer" ends a habit or a taste: it retires the earlier affirmed fact of
+# the same slot family whose value it names in other words («кинзу» for «кинза»), and the
+# relation may be its opposite («разлюбил» vs «любит»).
+_LAPSE = re.compile(
+    r"(?<!\w)(?:больше\s+не|уже\s+не|более\s+не|перестал\w*|разлюбил\w*|бросил\w*|завязал\w*"
+    r"|отказал\w*\s+от|no\s+longer|any\s*more|stopped|quit|gave\s+up|giving\s+up|not\s+any\s+longer)"
+    r"(?!\w)",
+    re.IGNORECASE,
+)
+_ADDED = re.compile(
+    r"(?<!\w)(?:ещ[её]|тоже|также|вдобавок|кроме\s+того|also|too|as\s+well|in\s+addition)(?!\w)",
+    re.IGNORECASE,
+)
+_INSTEAD = (
+    re.compile(r"(?<!\w)вместо\s+(?P<old>[^,;:.!?\n]+?)(?=\s*[,;:.!?\n]|\s+[-—–]\s|\s*$)", re.I),
+    re.compile(
+        r"(?<!\w)instead\s+of\s+(?P<old>[^,;:.!?\n]+?)(?=\s*[,;:.!?\n]|\s+[-—–]\s|\s*$)", re.I
+    ),
+)
+
+
+def _replaced_sides(quote: str) -> list[str]:
+    out = retired_sides(quote)
+    for pat in _INSTEAD:
+        out += [" ".join(m.group("old").split()[:3]) for m in pat.finditer(quote)]
+    return [x for x in dict.fromkeys(out) if x]
+
+
+def _stems(text: str | None) -> set[str]:
+    words = _VALUE_WORD.findall((text or "").casefold().replace("ё", "е"))
+    return {w[: max(4, len(w) - 2)] for w in words if not w.isdigit()}
+
+
+def _met(x: str, ys: set[str]) -> bool:
+    return any(x.startswith(y) or y.startswith(x) for y in ys)
+
+
+def _named_by(side: str, value: str) -> bool:
+    """The replaced side names the value: every stem of the value is in the side's words
+    («вместо бокса по средам» names «бокс»)."""
+    sv, ss = _stems(value), _stems(side)
+    return bool(sv and ss) and all(_met(y, ss) for y in sv)
+
+
+def _lapses(a: dict[str, Any], c: dict[str, Any]) -> bool:
+    """A, a «больше не X» / "no longer X", ends C's affirmed X: same relation (A negated) or
+    another relation of the slot family (A affirmed: «разлюбил» against «любит»), and A's value
+    names C's (the same word stems both ways). A rival value («больше не ем мясо» vs fish) never
+    lapses."""
+    if c["polarity"] != "affirmed" or a["family"] is None or a["family"] != c.get("family"):
+        return False
+    if a["polarity"] == "affirmed" and a["relation"] == c["relation"]:
+        return False  # the same relation affirmed: the value rule above decides
+    quote = a["quote_orig"] or a["origin_quote"] or ""
+    if not _LAPSE.search(quote):
+        return False
+    sa, sc = _stems(_value_text(a)), _stems(_value_text(c))
+    # the same value, not a part of it: «больше не ем красное мясо» leaves «ест мясо»
+    return bool(sa and sc) and all(_met(x, sc) for x in sa) and all(_met(y, sa) for y in sc)
 
 
 def rule_match(conn: sqlite3.Connection, record_id: str) -> list[str]:
@@ -746,6 +821,8 @@ def rule_match(conn: sqlite3.Connection, record_id: str) -> list[str]:
     if not found:
         return []
     a = found[0]
+    if a["relation"] == "other" and a["status"] in _USABLE and a["stability"] != "one_off":
+        return _same_measure(conn, a)
     if (
         a["status"] not in _USABLE
         or a["family"] is None
@@ -760,6 +837,92 @@ def rule_match(conn: sqlite3.Connection, record_id: str) -> list[str]:
         (a["subject"], a["family"], record_id),
     )
     return [c["id"] for c in rows if _matches(a, c)]
+
+
+# An `other` fact has no relation family, so §8.3 never sees two of them as one slot.
+# A number with the same unit on the same subject («6 тысяч в месяц» → «12 тысяч с января»,
+# "40 minutes" → "25 minutes") is one measure: the later value replaces the earlier, unless
+# the later words state both as current (one message, or the old number in its quote) or a
+# period tells them apart (в месяц / в год, per day / per week).
+_MEASURE = re.compile(
+    r"(?<![\w.,])(?P<n>\d+(?:[.,]\d+)?)\s*(?P<u>[^\W\d_]+|[$€₽£¥%])"
+    r"|(?P<c>[$€₽£¥])\s*(?P<m>\d+(?:[.,]\d+)?)",
+    re.IGNORECASE,
+)
+_PER = re.compile(
+    r"(?<!\w)(?:в|за|per|a|an|each|/)\s*(?P<p>месяц|год|день|сутки|недел|час|month|year|day"
+    r"|week|hour|night|ноч)",
+    re.IGNORECASE,
+)
+
+
+def _measure(text: str | None) -> tuple[str, str, str] | None:
+    """(number, unit stem, period) of the first amount in a value, else None."""
+    t = (text or "").casefold().replace("ё", "е")
+    m = _MEASURE.search(t)
+    if m is None:
+        return None
+    num, unit = (m["n"], m["u"]) if m["n"] else (m["m"], m["c"])
+    per = _PER.search(t)
+    return num.replace(",", "."), unit[:4], per["p"][:4] if per else ""
+
+
+_WHEN_WORDS = frozenset((
+    "январ", "феврал", "март", "апрел", "мая", "май", "июн", "июл", "август", "сентя",
+    "октяб", "ноябр", "декаб", "janua", "febru", "march", "april", "june", "july", "augus",
+    "septe", "octob", "novem", "decem", "with", "from", "since", "until", "now", "теперь",
+))  # fmt: skip
+
+
+def _measure_words(text: str | None) -> set[str]:
+    """What an amount is OF: the value's words beyond its number, unit, period and when."""
+    m = _measure(text)
+    skip = {m[1], m[2]} if m else set()
+    return {
+        w
+        for w in _value_words(text)
+        if len(w) >= 4
+        and not any(w.startswith(x) or x.startswith(w) for x in skip if x)
+        and not any(w.startswith(x[:4]) for x in _WHEN_WORDS)
+    }
+
+
+def _same_measure(conn: sqlite3.Connection, a: dict[str, Any]) -> list[str]:
+    """The earlier `other` facts of A's subject whose amount A replaces (see `_MEASURE`).
+    Never the user's own `other` facts (sleep, work hours and rent share units), never
+    across speakers A may not supersede, never a negation or a scoped instance."""
+    from .model import OWNER_ENTITY_ID
+
+    ma = _measure(_value_text(a))
+    if ma is None or a["subject"] in (None, OWNER_ENTITY_ID) or a["polarity"] != "affirmed":
+        return []
+    quote = a["quote_orig"] or a["origin_quote"] or ""
+    own_raws = _source_raws(conn, a["id"])
+    out: list[str] = []
+    rows = _fact_rows(
+        conn,
+        f"f.subject_id = ? AND f.relation = 'other' AND f.id <> ? AND r.status IN {_USABLE}"
+        " ORDER BY r.recorded_at, r.id",
+        (a["subject"], a["id"]),
+    )
+    for c in rows:
+        mc = _measure(_value_text(c))
+        if mc is None or mc[1] != ma[1] or mc[0] == ma[0] or c["polarity"] != "affirmed":
+            continue
+        if mc[2] and ma[2] and mc[2] != ma[2]:
+            continue  # «6 тысяч в месяц» and «60 тысяч в год»: two measures
+        wa, wc = _measure_words(_value_text(a)), _measure_words(_value_text(c))
+        if wa and wc and not wa & wc:
+            continue  # «до школы 10 минут» and «до метро 5 минут»: two distances
+        if c["stability"] == "one_off" or _plan_class(a["fkind"]) != _plan_class(c["fkind"]):
+            continue
+        if _scope(a["applicability"]) != _scope(c["applicability"]):
+            continue
+        if own_raws & _source_raws(conn, c["id"]) or holds_value(mc[0], quote):
+            continue  # both stated as current
+        if _said_before(c, a) and _may_supersede_rows(a, c):
+            out.append(c["id"])
+    return out
 
 
 def supersede(ctx: CommitCtx, old_id: str, new_id: str) -> None:
@@ -781,6 +944,7 @@ def supersede(ctx: CommitCtx, old_id: str, new_id: str) -> None:
                 set_status(ctx, cid, Status.SUPERSEDED)
                 add_edge(ctx, new_id, cid, EdgeType.SUPERSEDES)
                 _retire_value(ctx, cid)
+    _carry_moved_day(ctx, old_id, new_id)
 
 
 # ---------------------------------------------------------------- said order
@@ -982,6 +1146,10 @@ def _source_raws(conn: sqlite3.Connection, rid: str) -> set[str]:
     }
 
 
+def _others_scope(applicability: str | None) -> dict[str, Any]:
+    return {k: v for k, v in _scope(applicability).items() if k in ("for_whom", "audience")}
+
+
 def carriers(conn: sqlite3.Connection, rid: str, *, exclude: Sequence[str] = ()) -> list[str]:
     """Every other usable record that carries the value fact `rid` holds, so one correction
     retires them all (guarantees 3 and 5): the episodes built from it (as seed or
@@ -990,13 +1158,14 @@ def carriers(conn: sqlite3.Connection, rid: str, *, exclude: Sequence[str] = ())
     value. A rival value, a negated or one-off override, another subject or another source's
     retelling is never a carrier."""
     row = conn.execute(
-        "SELECT f.subject_id, f.relation, f.value_norm, f.value_text, f.polarity, f.stability"
-        " FROM facts f WHERE f.id = ?",
+        "SELECT f.subject_id, f.relation, f.value_norm, f.value_text, f.polarity, f.stability,"
+        " f.applicability FROM facts f WHERE f.id = ?",
         (rid,),
     ).fetchone()
     if row is None:
         return []
-    subject, relation, vnorm, vtext, polarity, stability = row
+    subject, relation, vnorm, vtext, polarity, stability, appl = row
+    other = _others_scope(appl)
     skip = {rid, *exclude}
     out: list[str] = [
         r[0]
@@ -1010,14 +1179,17 @@ def carriers(conn: sqlite3.Connection, rid: str, *, exclude: Sequence[str] = ())
     ]
     words = _value_words(vtext)
     raws = _source_raws(conn, rid)
-    for cid, crel, cnorm, ctext, cpol, cstab, ctier in conn.execute(
+    for cid, crel, cnorm, ctext, cpol, cstab, ctier, cappl in conn.execute(
         "SELECT f.id, f.relation, f.value_norm, f.value_text, f.polarity, f.stability,"
-        " r.author_tier FROM facts f JOIN records r ON r.id = f.id WHERE f.subject_id = ?"
+        " r.author_tier, f.applicability FROM facts f JOIN records r ON r.id = f.id"
+        " WHERE f.subject_id = ?"
         f" AND r.kind IN ('fact', 'preference') AND r.status IN {_USABLE}",
         (subject,),
     ):
         if cid in skip or cpol != polarity or (cstab == "one_off") != (stability == "one_off"):
             continue
+        if _others_scope(cappl) != other:
+            continue  # what the user does for someone else is not a copy of the user's own
         same = crel == relation and (
             (vnorm is not None and cnorm == vnorm)
             or (bool(vtext) and (ctext or "").casefold().strip() == vtext.casefold().strip())
@@ -1182,8 +1354,14 @@ _DOTTED = re.compile(r"(?<![\d.])(\d{1,2})\.(\d{1,2})(?:\.(\d{4}|\d{2}))?(?![\d.
 _DAY_MONTH = re.compile(
     rf"(?<!\d)(\d{{1,2}})(?:st|nd|rd|th|-?го|-?е)?(?:\s+of)?\s+({_MONTH_RE})(?!\w)(?:,?\s+(\d{{4}}))?"
 )
+# A number followed by a magnitude, currency or percent is an amount, not a day:
+# «с января 12 тысяч», "since January 12k".
+_AMOUNT_AHEAD = (
+    r"(?!\s*(?:тыс|млн|млрд|руб|₽|долл|евро|бакс|thousand|million|billion|k(?!\w)|m(?!\w)|%|\$|€"
+    r"|usd|eur|rub|dollars?|bucks|euros?|pounds?))"
+)
 _MONTH_DAY = re.compile(
-    rf"(?<!\w)({_MONTH_RE})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?(?!\d)(?:,?\s+(\d{{4}}))?"
+    rf"(?<!\w)({_MONTH_RE})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?(?!\d){_AMOUNT_AHEAD}(?:,?\s+(\d{{4}}))?"
 )
 _PHONE = re.compile(r"\+?\d[\d\s()\-]{5,}\d")
 _NUMBER = re.compile(r"(?<![\w.])\d+(?:[.,]\d+)?(?!\w)")
@@ -1235,6 +1413,362 @@ def value_tokens(text: str) -> set[str]:
     take(_PHONE, phone)
     take(_NUMBER, lambda m: {"num:" + (m.group().replace(",", ".").lstrip("0") or "0")})
     return toks
+
+
+# ------------------------------------------------------- a moved day reaches what rests on it
+# A dated record whose day moves (a superseding record holds another day) carries the
+# records that rest on it: the ones it justifies, the ones derived from it, and the ones
+# whose own words give a reason naming its subject («чтобы Денис успел», "so Dana can make
+# it", "because Lev is back"). A window taken from the moved day moves with it; a window
+# the dependent states in its own words stays, and the core says the premise moved. A
+# record that is only dated near the old day, with no such link, is not touched.
+
+_WEEKDAY_WORDS = tuple(
+    (re.compile(p, re.IGNORECASE), days)
+    for p, days in (
+        (r"(?<!\w)(?:monday|понедельник\w*)(?!\w)", (0,)),
+        (r"(?<!\w)(?:tuesday|вторник\w*)(?!\w)", (1,)),
+        (r"(?<!\w)(?:wednesday|сред[аеуы])(?!\w)", (2,)),
+        (r"(?<!\w)(?:thursday|четверг\w*)(?!\w)", (3,)),
+        (r"(?<!\w)(?:friday|пятниц\w*)(?!\w)", (4,)),
+        (r"(?<!\w)(?:saturday|суббот\w*)(?!\w)", (5,)),
+        (r"(?<!\w)(?:sunday|воскресень\w*)(?!\w)", (6,)),
+        (r"(?<!\w)(?:weekend|выходн\w+)(?!\w)", (5, 6)),
+    )
+)
+_BARE_DAY = re.compile(r"(?<![\d:./])(\d{1,2})(?:-?го|-?е|st|nd|rd|th)(?!\w)", re.IGNORECASE)
+_RANGE_TO = r"\s*(?:[-–—]|по|to|through|thru|until|till)\s*"
+_DAY_RANGE = re.compile(
+    rf"(?<!\d)(\d{{1,2}})(?:st|nd|rd|th|-?го|-?е)?{_RANGE_TO}(\d{{1,2}})(?:st|nd|rd|th|-?го|-?е)?"
+    rf"(?:\s+of)?\s+({_MONTH_RE})(?!\w)"
+    rf"|(?<!\w)({_MONTH_RE})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?{_RANGE_TO}(\d{{1,2}})(?!\d)",
+    re.IGNORECASE,
+)
+# a reason or purpose clause: what follows ties the record to someone else's day
+_REASON_LEAD = re.compile(
+    r"(?<!\w)(?:чтобы|чтоб|потому\s+что|так\s+как|из-за|ради|раз|пока|когда|как\s+только"
+    r"|после\s+того,?\s+как|к\s+(?:приезду|возвращению|приходу|прилёту|прилету)"
+    r"|so(?:\s+that)?|in\s+order\s+(?:for|that)|because|since|as\s+soon\s+as|once|when"
+    r"|after|until|till|while|due\s+to|given\s+that)(?!\w)",
+    re.IGNORECASE,
+)
+_CLAUSE_STOP = re.compile(r"[.;!?\n]")
+_NAME_TOKEN = re.compile(r"[^\W\d_][\w'’-]*")
+_DAY_ROW_SQL = (
+    "SELECT f.id, f.subject_id, f.value_text, f.value_norm, f.text_en, f.quote_orig,"
+    " f.valid_from, f.valid_to, r.status, r.recorded_at, r.retired_at, r.origin_quote"
+    " FROM facts f JOIN records r ON r.id = f.id WHERE f.id = ?"
+)
+
+
+def _day(value: Any) -> date | None:
+    try:
+        return date.fromisoformat(str(value)[:10]) if value else None
+    except ValueError:
+        return None
+
+
+def _mk_day(year: int, month: int, day: int) -> date | None:
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def _without_sides(text: str) -> str:
+    """The text with the old side of the user's «не X, а Y» / "not X but Y" blanked out."""
+    for side in retired_sides(text):
+        text = text.replace(side, " ")
+    return text
+
+
+def said_days(
+    texts: Iterable[Any], year: int, *, month: int | None = None, near: date | None = None
+) -> set[date]:
+    """The days these words name: dates and day ranges («9–10 мая», "May 9-10"); with a
+    `month`, a bare day («10-го», "the 13th"); with `near` and no day found, a lone weekday
+    (the one nearest to `near`)."""
+    out: set[date] = set()
+    weekdays: set[int] = set()
+    for x in texts:
+        if not isinstance(x, str) or not x.strip():
+            continue
+        s = x.casefold()
+        for m in _DAY_RANGE.finditer(s):
+            a, b, mon = (m[1], m[2], m[3]) if m[1] else (m[5], m[6], m[4])
+            lo, hi = int(a), int(b)
+            if lo < hi <= lo + 14:
+                out |= {d for k in range(lo, hi + 1) if (d := _mk_day(year, _MONTHS[mon], k))}
+        toks = value_tokens(s)
+        full = {t[-5:]: int(t[5:9]) for t in toks if t.startswith("date:") and len(t) == 15}
+        for t in toks:
+            if t.startswith("date:"):
+                md = t[-5:]
+                if d := _mk_day(full.get(md, year), int(md[:2]), int(md[3:])):
+                    out.add(d)
+        if month is not None:
+            for m in _BARE_DAY.finditer(s):
+                if d := _mk_day(year, month, int(m[1])):
+                    out.add(d)
+        weekdays |= {w for rx, ds in _WEEKDAY_WORDS if rx.search(s) for w in ds}
+    if not out and near is not None and len(weekdays) == 1:
+        (w,) = weekdays
+        ahead, back = (w - near.weekday()) % 7, (near.weekday() - w) % 7
+        out.add(near + timedelta(days=ahead if ahead <= back else -back))
+    return out
+
+
+def _named_weekdays(*texts: Any) -> set[int]:
+    return {
+        w
+        for x in texts
+        if isinstance(x, str)
+        for rx, ds in _WEEKDAY_WORDS
+        if rx.search(x)
+        for w in ds
+    }
+
+
+def _bounds(row: sqlite3.Row, closed: Iterable[str] = ()) -> set[date]:
+    """A record's own bounds; an end a fix set when it retired the record (on the day of
+    the retirement or of the correcting record) is not a day the user named."""
+    shut = {str(row["retired_at"] or "")[:10], *closed}
+    out = {d for d in (_day(row["valid_from"]),) if d}
+    end = _day(row["valid_to"])
+    if end is not None and end.isoformat() not in shut:
+        out.add(end)
+    return out
+
+
+def _record_days(
+    row: sqlite3.Row, *, anchor: date | None = None, closed: Iterable[str] = ()
+) -> set[date]:
+    """The days a record holds. An old record: its value's and its words', else its bounds
+    (a fix may have closed them). With an `anchor` (the corrected record's day), the new
+    record: its value's, else its words', else its bounds; a bare day or a lone weekday
+    resolves next to the anchor and the retired side of the user's contrast is not read."""
+    bounds = _bounds(row, closed)
+    base = anchor or min(bounds, default=None) or _day(row["recorded_at"])
+    if base is None:
+        return set()
+    month = anchor.month if anchor else None
+
+    def read(*texts: Any) -> set[date]:
+        got = [_without_sides(t) if anchor else t for t in texts if isinstance(t, str) and t]
+        return said_days(got, base.year, month=month, near=anchor)
+
+    vals = read(row["value_text"], row["value_norm"])
+    words = read(row["quote_orig"], row["text_en"], row["origin_quote"])
+    if anchor is None:
+        return (vals | words) or bounds
+    return vals or words or bounds
+
+
+def _pair_days(old: set[date], new: set[date]) -> dict[date, date]:
+    """Old day -> new day: in order when both hold as many days (a shifted window), else
+    each new day takes the nearest old day the new record no longer holds."""
+    if not old or not new or old == new:
+        return {}
+    if len(old) == len(new):
+        return {o: n for o, n in zip(sorted(old), sorted(new), strict=True) if o != n}
+    left = sorted(old - new)
+    out: dict[date, date] = {}
+    for n in sorted(new - old):
+        if left:
+            o = min(left, key=lambda d: (abs((d - n).days), d))
+            left.remove(o)
+            out[o] = n
+    return out
+
+
+def day_move(conn: sqlite3.Connection, old_id: str, new_id: str) -> dict[date, date]:
+    """The days `old_id` held that `new_id` moved, old day -> new day; empty when the
+    correction kept the day (a time-only fix, another value of an undated slot)."""
+    o = conn.execute(_DAY_ROW_SQL, (old_id,)).fetchone()
+    n = conn.execute(_DAY_ROW_SQL, (new_id,)).fetchone()
+    if o is None or n is None:
+        return {}
+    closed = [
+        str(r[0])[:10]
+        for r in conn.execute(
+            "SELECT r.recorded_at FROM edges e JOIN records r ON r.id = e.from_id"
+            " WHERE e.to_id = ? AND e.etype = 'supersedes'",
+            (old_id,),
+        )
+    ]
+    old = _record_days(o, closed=closed)
+    if not old:
+        return {}
+    return _pair_days(old, _record_days(n, anchor=min(old)))
+
+
+def reason_names(conn: sqlite3.Connection, texts: Iterable[Any]) -> set[str]:
+    """The people (and other named entities) a reason or purpose clause of these words
+    names: «…, чтобы Денис тоже успел», "so Dana can make it", "because Lev is back"."""
+    keys: set[str] = set()
+    for x in texts:
+        if not isinstance(x, str):
+            continue
+        for m in _REASON_LEAD.finditer(x):
+            tail = x[m.end() :]
+            stop = _CLAUSE_STOP.search(tail)
+            for tok in _NAME_TOKEN.findall(tail[: stop.start()] if stop else tail):
+                tok = re.sub(r"['’]s$", "", tok)
+                key = entities.normalize_alias(tok)
+                if len(key) >= 2:
+                    keys |= {key, *entities.name_bases(tok)}
+                    keys |= {entities.normalize_alias(t) for t in entities.transliterations(tok)}
+    if not keys:
+        return set()
+    marks = ", ".join("?" for _ in keys)
+    rows = conn.execute(
+        f"SELECT DISTINCT entity_id FROM aliases WHERE alias_norm IN ({marks})",  # noqa: S608
+        sorted(keys),
+    )
+    return {r[0] for r in rows} - {OWNER_ENTITY_ID}
+
+
+def _stated(row: sqlite3.Row, day: date) -> bool:
+    """The record's own words name this day (a date, a range, a bare day or its weekday)."""
+    words = (row["text_en"], row["quote_orig"], row["value_text"], row["value_norm"])
+    return day in said_days(words, day.year, month=day.month) or (
+        day.weekday() in _named_weekdays(*words)
+    )
+
+
+def _touches(row: sqlite3.Row, moved: dict[date, date]) -> bool:
+    """A moved day is in the record's window: a bound sits on it, a closed window holds it,
+    or its own words name it. An open-ended state («since 2024») holds no one day."""
+    lo, hi = _day(row["valid_from"]), _day(row["valid_to"])
+    if lo is None and hi is None:
+        return False
+    return any(
+        d in (lo, hi) or (lo is not None and hi is not None and lo <= d <= hi) or _stated(row, d)
+        for d in moved
+    )
+
+
+def _redated(row: sqlite3.Row, moved: dict[date, date]) -> dict[str, str]:
+    """New bounds for a window taken from a moved day: each bound their words do not state
+    moves by the shift of the moved day it sat on. Empty when no unstated bound sat on one
+    or the window would turn inside out."""
+    cols = {c: _day(row[c]) for c in ("valid_from", "valid_to")}
+    free = {c: d for c, d in cols.items() if d is not None and not _stated(row, d)}
+    hit = [d for d in free.values() if d in moved]
+    if not hit:
+        return {}
+    shift = moved[hit[0]] - hit[0]
+    out = {c: (moved.get(d) or d + shift) for c, d in free.items()}
+    lo, hi = out.get("valid_from", cols["valid_from"]), out.get("valid_to", cols["valid_to"])
+    if lo is not None and hi is not None and lo > hi:
+        return {}
+    return {c: d.isoformat() + str(row[c])[10:] for c, d in out.items()}
+
+
+def _resting_on(conn: sqlite3.Connection, old_id: str, moved: dict[date, date]) -> list[str]:
+    """Facts that rest on `old_id`: it justifies them, they are derived from it, or a reason
+    clause of their own words names its subject and their window holds a moved day."""
+    ids = [
+        r[0]
+        for r in conn.execute(
+            "SELECT target_record_id FROM justifications WHERE member_record_id = ?"
+            " UNION SELECT from_id FROM edges WHERE to_id = ? AND etype = 'derived_from'",
+            (old_id, old_id),
+        )
+    ]
+    row = conn.execute("SELECT subject_id FROM facts WHERE id = ?", (old_id,)).fetchone()
+    subj = row[0] if row is not None else None
+    if subj and subj != OWNER_ENTITY_ID:
+        lo, hi = min(moved).isoformat(), max(moved).isoformat()
+        for r in conn.execute(
+            "SELECT f.id, f.text_en, f.quote_orig FROM facts f JOIN records r ON r.id = f.id"
+            " WHERE r.status IN ('active', 'archived') AND f.id != ?"
+            " AND (f.valid_from IS NOT NULL OR f.valid_to IS NOT NULL)"
+            " AND substr(coalesce(f.valid_from, '0000-00-00'), 1, 10) <= ?"
+            " AND substr(coalesce(f.valid_to, '9999-12-31'), 1, 10) >= ?",
+            (old_id, hi, lo),
+        ):
+            if subj in reason_names(conn, (r[1], r[2])):
+                ids.append(r[0])
+    return list(dict.fromkeys(ids))
+
+
+def _carry_moved_day(ctx: CommitCtx, old_id: str, new_id: str) -> None:
+    """The user's correction moved `old_id`'s day: a window taken from it moves to the new
+    day; the records resting on it are rebuilt and re-served either way."""
+    moved = day_move(ctx.conn, old_id, new_id)
+    if not moved:
+        return
+    redated: list[str] = []
+    reached: list[str] = []
+    for rid in _resting_on(ctx.conn, old_id, moved):
+        row = ctx.conn.execute(_DAY_ROW_SQL, (rid,)).fetchone()
+        if rid == new_id or row is None or row["status"] not in _USABLE:
+            continue
+        if not _touches(row, moved):
+            continue
+        reached.append(rid)
+        upd = _redated(row, moved)
+        if upd:
+            sets = ", ".join(f"{c} = ?" for c in upd)
+            ctx.conn.execute(f"UPDATE facts SET {sets} WHERE id = ?", [*upd.values(), rid])  # noqa: S608
+            redated.append(rid)
+    if redated:
+        bump(ctx, redated)
+    if reached:
+        invalidate(ctx, reached)
+        mark_pending_updates(ctx, reached)
+
+
+def premise_moves(
+    conn: sqlite3.Connection, rid: str
+) -> tuple[dict[str, str | None], list[tuple[str | None, str]]]:
+    """How a dated record reads after a day it rests on moved: (bounds, notes). `bounds`
+    maps a bound to the day to show instead (a window taken from the moved day) or to None
+    (a day their words state that no longer holds for the premise); `notes` are (subject,
+    new day) of each moved premise."""
+    row = conn.execute(_DAY_ROW_SQL, (rid,)).fetchone()
+    if row is None or not (row["valid_from"] or row["valid_to"]):
+        return {}, []
+    prem = [
+        r[0]
+        for r in conn.execute(
+            "SELECT member_record_id FROM justifications WHERE target_record_id = ?"
+            " UNION SELECT to_id FROM edges WHERE from_id = ? AND etype = 'derived_from'",
+            (rid, rid),
+        )
+    ]
+    named = reason_names(conn, (row["text_en"], row["quote_orig"]))
+    if named:
+        marks = ", ".join("?" for _ in named)
+        prem += [
+            r[0]
+            for r in conn.execute(
+                "SELECT f.id FROM facts f JOIN records r ON r.id = f.id WHERE r.status ="
+                f" 'superseded' AND f.subject_id IN ({marks}) AND f.id != ?",  # noqa: S608
+                [*sorted(named), rid],
+            )
+        ]
+    bounds: dict[str, str | None] = {}
+    notes: list[tuple[str | None, str]] = []
+    for pid in dict.fromkeys(prem):
+        p = conn.execute(_DAY_ROW_SQL, (pid,)).fetchone()
+        if p is None or p["status"] != Status.SUPERSEDED.value:
+            continue
+        head = _usable_head(conn, pid)
+        moved = day_move(conn, pid, head) if head and head != pid else {}
+        if not moved or not _touches(row, moved):
+            continue
+        for col, d in _redated(row, moved).items():
+            bounds[col] = d
+        for col in ("valid_from", "valid_to"):
+            d = _day(row[col])
+            if d in moved and col not in bounds and _stated(row, d):
+                bounds[col] = None
+        note = (p["subject_id"], max(moved.values()).isoformat())
+        if note not in notes:
+            notes.append(note)
+    return bounds, notes
 
 
 def check_retracted(

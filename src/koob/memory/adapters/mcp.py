@@ -377,11 +377,48 @@ def _serve(conn: sqlite3.Connection, turn: TurnCtx, refs: list[ReadRef]) -> None
 # ---------------------------------------------------------------- writes (§6.1, §9)
 
 
-def _write_out(res: Any) -> str:
+def _write_out(res: Any, status: list[str] | None = None) -> str:
     out = res.model_dump(mode="json", exclude_none=True)
     if res.outcome == "ask_first":
         out["ask"] = "Задай ему этот один вопрос и ничего не меняй до его ответа."
+    if status:
+        out["status"] = [clean(x) for x in status]
     return _json(out)
+
+
+def _fix_status(conn: sqlite3.Connection, res: Any, target: str, turn: TurnCtx) -> list[str]:
+    """The fix reports where things stand - how many items went to review, or that what
+    the user names is already forgotten or retracted (no value of it in the line)."""
+    from ..commands import _plural, is_english, target_status
+
+    en = is_english(turn.owner_words)
+    n = int(getattr(res, "dependents_to_review", 0) or 0)
+    if res.outcome == "committed":
+        if not n:
+            return []
+        if en:
+            return [f"Sent {n} {'item' if n == 1 else 'items'} that rested on it to review."]
+        return [
+            f"Отправил на проверку {n} {_plural(n, 'запись', 'записи', 'записей')},"
+            " которые на этом держались."
+        ]
+    return target_status(conn, target, turn)
+
+
+def _forget_status(conn: sqlite3.Connection, res: Any, target: str, turn: TurnCtx) -> list[str]:
+    """The forget reports where it stands - in the trash (with «Вернуть»), purging,
+    fully deleted, brought back; or that it is already forgotten."""
+    from ..commands import forget_order_line, is_english, target_status
+
+    en = is_english(turn.owner_words)
+    if res.forget_id and res.outcome in ("stopped", "purged", "undone"):
+        line = forget_order_line(conn, res.forget_id, en=en)
+        return [line] if line else []
+    if res.outcome == "not_found":
+        return target_status(conn, target, turn) or [
+            "No such thing in memory." if en else "Такого в памяти нет."
+        ]
+    return []
 
 
 def _remember(conn: sqlite3.Connection, p: RememberIn, turn: TurnCtx) -> str:
@@ -411,7 +448,7 @@ def _fix(conn: sqlite3.Connection, p: FixIn, turn: TurnCtx) -> str:
         retract=p.retract,
         store=conn,
     )
-    return _write_out(res)
+    return _write_out(res, _fix_status(conn, res, p.target, turn))
 
 
 def _forget(conn: sqlite3.Connection, p: ForgetIn, turn: TurnCtx) -> str:
@@ -425,7 +462,7 @@ def _forget(conn: sqlite3.Connection, p: ForgetIn, turn: TurnCtx) -> str:
         forever=p.forever,
         store=conn,
     )
-    return _write_out(res)
+    return _write_out(res, _forget_status(conn, res, p.target, turn))
 
 
 _RUN: dict[str, Callable[[sqlite3.Connection, Any, TurnCtx], str]] = {

@@ -286,6 +286,149 @@ _NAMES: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
     ("Галина", ("Galina",), ("Галя",)),
 )
 
+# English diminutive families: (full name, its conventional Russian spelling, diminutives).
+# English short forms are not morphology (Bob and Rob are both Robert, Bill and Will both
+# William), so they need a table; the pet endings on top of a short form (Bobby, Robbie,
+# Lizzie, Jimmy) are a rule (`_en_root`), so the table lists each form once.
+_EN_NAMES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("Robert", "Роберт", ("Rob", "Bob", "Bert")),
+    ("William", "Уильям", ("Will", "Bill", "Willie")),
+    ("Elizabeth", "Элизабет", ("Liz", "Beth", "Betty", "Betsy", "Eliza", "Libby")),
+    ("Richard", "Ричард", ("Rich", "Rick", "Dick")),
+    ("James", "Джеймс", ("Jim", "Jamie", "Jimbo")),
+    ("John", "Джон", ("Jack", "Johnny")),
+    ("Michael", "Майкл", ("Mike", "Mick", "Mikey")),
+    ("Thomas", "Томас", ("Tom",)),
+    ("Joseph", "Джозеф", ("Joe", "Joey")),
+    ("Daniel", "Дэниел", ("Dan",)),
+    ("Matthew", "Мэттью", ("Matt",)),
+    ("Christopher", "Кристофер", ("Chris",)),
+    ("Christina", "Кристина", ("Chris", "Tina", "Christie")),
+    ("Nicholas", "Николас", ("Nick", "Nicky")),
+    ("Anthony", "Энтони", ("Tony",)),
+    ("Edward", "Эдвард", ("Ed", "Eddie", "Ted", "Ned")),
+    ("Charles", "Чарльз", ("Charlie", "Chuck")),
+    ("Benjamin", "Бенджамин", ("Ben",)),
+    ("Samuel", "Сэмюэл", ("Sam",)),
+    ("Samantha", "Саманта", ("Sam",)),
+    ("Steven", "Стивен", ("Steve", "Stephen")),
+    ("Andrew", "Эндрю", ("Andy", "Drew")),
+    ("Jonathan", "Джонатан", ("Jon",)),
+    ("Timothy", "Тимоти", ("Tim",)),
+    ("Patrick", "Патрик", ("Pat",)),
+    ("Patricia", "Патрисия", ("Pat", "Patty", "Trish")),
+    ("Margaret", "Маргарет", ("Maggie", "Meg", "Peggy")),
+    ("Katherine", "Кэтрин", ("Kate", "Katie", "Kathy", "Cathy", "Kat", "Catherine", "Kathryn")),
+    ("Jennifer", "Дженнифер", ("Jen", "Jenny")),
+    ("Rebecca", "Ребекка", ("Becky", "Becca")),
+    ("Susan", "Сьюзан", ("Sue", "Susie")),
+    ("Victoria", "Виктория", ("Vicky", "Tori")),
+    ("Alexander", "Александр", ("Alex", "Xander")),
+    ("Alexandra", "Александра", ("Alex", "Lexi")),
+    ("Zachary", "Закари", ("Zach", "Zack")),
+    ("Gregory", "Грегори", ("Greg",)),
+    ("Jacob", "Джейкоб", ("Jake",)),
+    ("Kimberly", "Кимберли", ("Kim",)),
+    ("Abigail", "Эбигейл", ("Abby",)),
+    ("Theodore", "Теодор", ("Theo", "Ted")),
+)
+_EN_PET = ("ie", "ey", "y")
+
+
+def _en_root(token: str) -> str:
+    """A Latin name token without its pet ending (Bobby -> bob, Robbie -> rob, Lizzie -> liz,
+    Jimmy -> jim); a short name keeps its letters (Amy, Joy stay whole)."""
+    t = normalize_alias(token)
+    if not t or " " in t or not t.isascii() or not t.isalpha():
+        return ""
+    for end in _EN_PET:
+        stem = t[: -len(end)]
+        if t.endswith(end) and len(stem) >= 3:
+            return stem[:-1] if len(stem) >= 4 and stem[-1] == stem[-2] else stem
+    return t
+
+
+def _en_family(token: str) -> list[str]:
+    """The English families a Latin name token belongs to, by the table and the pet-ending
+    rule (Bobby ~ Bob -> Robert, Rob, Bert ...); [] for any other token."""
+    root = _en_root(token)
+    if not root:
+        return []
+    out: list[str] = []
+    for full, ru, dims in _EN_NAMES:
+        members = (full, *dims)
+        if root in {_en_root(m) for m in members} or normalize_alias(token) in {
+            normalize_alias(m) for m in members
+        }:
+            out += [full, *dims, ru]
+    return list(dict.fromkeys(out))
+
+
+def _surname_agrees(a: str, b: str) -> bool:
+    """Two surname tokens of one person: equal, the same in the other script, or one is the
+    other's initial («K», «K.» ~ Kowalski)."""
+    x, y = normalize_alias(a).rstrip("."), normalize_alias(b).rstrip(".")
+    if not x or not y:
+        return False
+    if x == y or y in {normalize_alias(t) for t in transliterations(x)}:
+        return True
+    short, long_ = (x, y) if len(x) <= len(y) else (y, x)
+    return len(short) == 1 and len(long_) >= 2 and long_.startswith(short)
+
+
+def same_person_names(a: str | None, b: str | None) -> bool:
+    """Two display names that name one person by the names alone: the first names are one
+    name or one diminutive family (Rob K ~ Bob Kowalski, Саша Белова ~ Александра Белова)
+    AND the surnames agree (equal, transliterated, or an initial). A first name alone never
+    makes two people one: either side without a surname is False."""
+    pa = [p for p in re.split(r"[\s]+", normalize_alias(a or "")) if p]
+    pb = [p for p in re.split(r"[\s]+", normalize_alias(b or "")) if p]
+    if len(pa) < 2 or len(pb) < 2:
+        return False
+    fa, fb = pa[0], pb[0]
+    first = fa == fb or fb in {
+        normalize_alias(t) for t in (*transliterations(fa), *name_family(fa))
+    }
+    return first and _surname_agrees(pa[-1], pb[-1])
+
+
+def first_name_keys(name: str | None) -> set[str]:
+    """The keys of a display name's first token that a namesake shares: the token, its other
+    script, its name family (Лена ~ Елена ~ Lena), and its Cyrillic roots. Empty for a name
+    with no letters."""
+    toks = [t for t in normalize_alias(name or "").split() if t]
+    if not toks:
+        return set()
+    first = toks[0].rstrip(".")
+    keys = {first, *(normalize_alias(t) for t in transliterations(first))}
+    keys |= {normalize_alias(t) for t in name_family(first)}
+    return {k.replace("ё", "е") for k in keys if len(k) >= 2}
+
+
+def namesake_groups(names: dict[str, str]) -> list[list[str]]:
+    """Person entities (id → display name) that share a first name but are not shown to be one
+    person (`same_person_names`): two people named Лена, a Sam from a chat and the user's own
+    Sam. Two people are never one on a first name alone, so the reader must tell them apart
+    before serving."""
+    ids = sorted(names)
+    keys = {e: first_name_keys(names[e]) for e in ids}
+    seen: set[str] = set()
+    out: list[list[str]] = []
+    for a in ids:
+        if a in seen or not keys[a]:
+            continue
+        group = [a]
+        for b in ids:
+            if b == a or b in seen or not keys[a] & keys[b]:
+                continue
+            if any(same_person_names(names[x], names[b]) for x in group):
+                continue  # one person minted twice: the full names agree
+            group.append(b)
+        if len(group) > 1:
+            seen.update(group)
+            out.append(group)
+    return out
+
 
 def transliterations(name: str) -> list[str]:
     """Саша <-> Sasha, by code (§10.3), both ways, plus the conventional spelling of a full
@@ -320,6 +463,8 @@ def name_family(name: str) -> list[str]:
         }
         if keys & member_keys:
             out += members + [t for d in dims for t in _code_translit(d)[:1]]
+    for k in sorted(keys):  # Bob, Bobby, «Боб» -> Robert, Rob, Bert, «Роберт»
+        out += _en_family(k)
     seen, res = {norm}, []
     for t in out:
         k = normalize_alias(t)
@@ -365,6 +510,39 @@ def _ru_lemmas(norm: str) -> set[str]:
             out.update({stem, stem + "а", stem + "я", stem + "й", stem + "ь"})
     out.discard(norm)
     return out
+
+
+# A Russian possessive adjective of a name in -а/-я keeps the name's stem before -ин
+# («Тёмин день рождения», «Сашина куртка», «у маминой подруги»); its own adjective ending
+# goes first. Longest first.
+_ADJ_ENDINGS = (
+    "ыми", "ими", "ого", "ому", "ой", "ом", "ым", "ых", "ую", "ая", "ое", "ые",
+    "ы", "а", "у", "о", "е",
+)  # fmt: skip
+
+
+def possessive_bases(token: str) -> set[str]:
+    """The nominative guesses a possessive form names: «Тёмин» / «Тёминой» → тёма, тёмя;
+    «мамин» → мама. General morphology (stem + -ин + an adjective ending), no name table."""
+    norm = normalize_alias(token)
+    if not norm or " " in norm or script_of(norm) != "cyrillic":
+        return set()
+    stems = {norm} | {norm[: -len(e)] for e in _ADJ_ENDINGS if norm.endswith(e)}
+    out: set[str] = set()
+    for st in stems:
+        if st.endswith("ин") and len(st) >= 4:
+            out |= {st[:-2] + "а", st[:-2] + "я"}
+    out.discard(norm)
+    return out
+
+
+def name_bases(token: str) -> set[str]:
+    """Every nominative a single Cyrillic word may be a form of: a case form («Тёме») or a
+    possessive («Тёмин»). The caller matches these against stored aliases only. Not a
+    tier of `resolve_rows`: there a name word becomes a forget's or a find's scope, and
+    «забудь про Костину драку» must keep covering the message by its words."""
+    norm = normalize_alias(token)
+    return _ru_lemmas(norm) | possessive_bases(norm)
 
 
 # Russian diminutive and affectionate suffixes, longest first («Сашенька», «Илюша», «Илюха»,
@@ -414,12 +592,13 @@ def family_of(token: str) -> list[str]:
     """The name families (full name, Latin spellings, diminutives) one of whose members
     shares a root of three letters or more with the token (Шурик ~ Шура → Александр)."""
     roots = {r for r in name_roots(token) if len(r) >= 3}
-    if not roots:
-        return []
     out: list[str] = []
-    for full, latin, dims in _NAMES:
-        if any(roots & {r for r in name_roots(m) if len(r) >= 3} for m in (full, *dims)):
-            out += [full, *latin, *dims]
+    if roots:
+        for full, latin, dims in _NAMES:
+            if any(roots & {r for r in name_roots(m) if len(r) >= 3} for m in (full, *dims)):
+                out += [full, *latin, *dims]
+    for t in (token, *_code_translit(token)):  # English short forms: Bobby ~ Rob → Robert
+        out += _en_family(t)
     return list(dict.fromkeys(out))
 
 

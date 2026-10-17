@@ -81,7 +81,7 @@ def test_overtaken_raw_quote_drops_out(conn, fix):
         _never_current(b.items, "Твер")
         assert "Твер" not in (b.block or "")
     b = api.recall(t("где я живу", n=2), store=conn)
-    assert "r-tvr" in [i.id for i in b.items]
+    assert {"r-tvr", "f-tvr"} & {i.id for i in b.items}  # the raw, or the record learned from it
 
 
 def test_retracted_record_drops_its_quote(conn):

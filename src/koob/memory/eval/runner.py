@@ -12,6 +12,7 @@ import random
 import re
 import tempfile
 import time
+from bisect import bisect_right
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -27,7 +28,8 @@ from . import graders
 from .graders import FAIL, PASS, SKIP
 from .judge import Judge, JudgeUnavailable, NoJudge
 from .loader import LoadedSet
-from .noise import expand
+from .matchers import DateOrder, date_order, locale_date_order
+from .noise import NoiseMsg, expand
 from .observe import MEMORY_CHANNELS, Check, Observation
 from .report import ProbeResult, RunReport, ScenarioResult, WordingResult
 from .routes import probe_route, route_tools
@@ -48,7 +50,7 @@ from .schema import (
     Worker,
 )
 from .sut import SUT, ApiSUT, NotBuilt
-from .timeutil import resolve_at, to_utc
+from .timeutil import REL_RE, resolve_at, to_utc
 
 
 @dataclass
@@ -100,13 +102,24 @@ def substitute(scn: Scenario, canaries: list[canary_mod.Canary]) -> Scenario:
 class _Step:
     t: datetime
     seq: int
-    kind: str  # event | probe
+    kind: str  # event | probe | noise (one time slice of a spread noise block)
     ev: Any = None
     probe: Probe | None = None
+    msgs: list[NoiseMsg] = field(default_factory=list)
+    final: bool = False  # the last slice of its block: the block's own event hooks run after it
+
+
+_RANK = {"event": 0, "probe": 1, "noise": 2}
 
 
 def _sort_key(s: _Step) -> tuple[datetime, int, int]:
-    return (s.t, 0 if s.kind == "event" else 1, s.seq)
+    # A noise slice ends before the next cut; a message sent at the very instant of an event,
+    # a probe or a worker run arrives just after it.
+    return (s.t, _RANK[s.kind], s.seq)
+
+
+def _relative(at: Any) -> bool:
+    return at is None or (isinstance(at, str) and bool(REL_RE.match(at)))
 
 
 class Runner:
@@ -223,16 +236,28 @@ class Runner:
         steps: list[_Step] = []
         prev = to_utc(self.scn.clock.start, self.tz)
         host_of: dict[str, list[Any]] = {}
+        commit_of: dict[str, str] = {}  # a racing worker -> the event its commit waits for
         seq = 0
+        spread: list[Noise] = []
+        # A noise block without `at` is spread over its span: its messages arrive in time slices
+        # between the other steps (see `_noise_slices`), so it does not move the timeline. Only a
+        # relative or missing `at` right after it counts from the end of the span.
+        after_noise: datetime | None = None
         for e in self.scn.timeline:
             if getattr(e, "during", None):
                 host_of.setdefault(e.during, []).append(e)
                 continue
             if isinstance(e, Noise) and e.at is None:
                 end = datetime.combine(e.span.to, datetime.min.time()) + timedelta(days=1)
-                t = max(prev + timedelta(minutes=1), to_utc(end, self.tz))
-            else:
-                t = max(prev, resolve_at(e.at, prev, self.tz))
+                floor = max(after_noise or prev + timedelta(minutes=1), to_utc(end, self.tz))
+                after_noise = floor
+                if e.id:
+                    self.event_time[e.id] = floor
+                spread.append(e)
+                continue
+            base = after_noise if after_noise is not None and _relative(e.at) else prev
+            t = max(prev, resolve_at(e.at, base, self.tz))
+            after_noise = None
             prev = t
             if e.id:
                 self.event_time[e.id] = t
@@ -243,6 +268,8 @@ class Runner:
                     self._held.setdefault(e.snapshot_at, []).append((f"{e.job}|{e.id}", "snapshot"))
                 if e.commit_after:
                     self._held.setdefault(e.commit_after, []).append((f"{e.job}|{e.id}", "commit"))
+                    if e.id:
+                        commit_of[e.id] = e.commit_after
             steps.append(_Step(t, seq, "event", ev=e))
             seq += 1
         self._during = host_of
@@ -267,12 +294,52 @@ class Runner:
                 continue
             if p.after and p.after not in self.event_time:
                 raise ValueError(f"probe {p.id}: after -> {p.after!r} has no time in the plan")
-            t = self.event_time[p.after] if p.after else to_utc(p.at, self.tz)  # type: ignore[arg-type]
+            if p.after:
+                # A probe after a racing worker asks once the worker is done: its commit waits
+                # for `commit_after`, so the probe does too (for every SUT alike).
+                t, anchor, seen = self.event_time[p.after], p.after, {p.after}
+                while anchor in commit_of and commit_of[anchor] not in seen:
+                    anchor = commit_of[anchor]
+                    seen.add(anchor)
+                    if anchor in self.event_time:
+                        t = max(t, self.event_time[anchor])
+            else:
+                t = to_utc(p.at, self.tz)  # type: ignore[arg-type]
             steps.append(_Step(t, seq, "probe", probe=p))
             seq += 1
+        cuts = sorted({s.t for s in steps})
+        for e in spread:
+            slices = self._noise_slices(e, cuts, seq)
+            seq += len(slices)
+            steps += slices
         steps.sort(key=_sort_key)
         # a probe right after its event: keep events at the same instant first (already by key)
         return steps
+
+    def _noise_slices(self, e: Noise, cuts: list[datetime], seq: int) -> list[_Step]:
+        """One spread noise block as time slices: the messages up to each other step (event or
+        probe) and each scheduled worker run arrive just before it, so a probe dated inside the
+        span sees the noise sent so far and an event inside the span keeps its own time."""
+        msgs = sorted(self._noise_msgs(e), key=lambda m: (m.at, m.msg_id))
+        if not msgs:
+            t = self.event_time.get(e.id or "") or to_utc(self.scn.clock.start, self.tz)
+            return [_Step(t, seq, "noise", ev=e, final=True)]
+        at = [to_utc(m.at, self.tz) for m in msgs]
+        bounds = list(cuts)
+        if self.scn.setup.workers == "scheduled":
+            lo = at[0] - timedelta(seconds=1)
+            bounds = sorted({*bounds, *(t for t, _ in self._schedule_points(lo, at[-1]))})
+        groups: dict[int, list[int]] = {}
+        for i, t in enumerate(at):
+            groups.setdefault(bisect_right(bounds, t), []).append(i)
+        out: list[_Step] = []
+        for k in sorted(groups):
+            idx = groups[k]
+            out.append(
+                _Step(at[idx[-1]], seq + len(out), "noise", ev=e, msgs=[msgs[i] for i in idx])
+            )
+        out[-1].final = True
+        return out
 
     # -------------------------------------------------------------- scheduling
 
@@ -403,12 +470,18 @@ class Runner:
     def _tg_id(self, contact: str) -> Any:
         return (self.contacts.get(contact) or {}).get("ids", {}).get("tg_user_id")
 
-    def _noise(self, e: Noise) -> None:
+    def _noise_msgs(self, e: Noise) -> list[NoiseMsg]:
         members: dict[str, list[str]] = {}
         for chat, info in (self.persona.get("chats") or {}).items():
             if isinstance(info, dict) and info.get("with"):
                 members[chat] = list(info["with"])
-        msgs = expand(e, scale=self.scale, contacts=self.contacts, chat_members=members)
+        return expand(e, scale=self.scale, contacts=self.contacts, chat_members=members)
+
+    def _noise(self, e: Noise) -> None:
+        """A noise block delivered at once (one with `at`, or one landing after a probe)."""
+        self._deliver_noise(self._noise_msgs(e))
+
+    def _deliver_noise(self, msgs: list[NoiseMsg]) -> None:
         rows = []
         for m in msgs:
             ts = iso(to_utc(m.at, self.tz))
@@ -544,7 +617,21 @@ class Runner:
 
     # -------------------------------------------------------------- run
 
+    def date_order(self) -> DateOrder | None:
+        """How "11/3" reads in this scenario: its own `date_order`, else the persona's locale."""
+        if self.scn.date_order:
+            return self.scn.date_order
+        langs = self.persona.get("langs") if isinstance(self.persona, dict) else None
+        tz = (
+            self.persona.get("tz") if isinstance(self.persona, dict) else None
+        ) or self.scn.clock.tz
+        return locale_date_order(tz, list(langs) if langs else None)
+
     def run(self) -> ScenarioResult:
+        with date_order(self.date_order()):  # every grade in this scenario, for every SUT alike
+            return self._run()
+
+    def _run(self) -> ScenarioResult:
         t0 = time.perf_counter()
         scn = self.scn
         res = ScenarioResult(
@@ -569,7 +656,11 @@ class Runner:
             plan = self._plan()
             for step in plan:
                 self._advance_to(step.t)
-                if step.kind == "event":
+                if step.kind == "noise":
+                    self._deliver_noise(step.msgs)
+                    if step.final:
+                        self._after_event(step.ev)
+                elif step.kind == "event":
                     self._apply(step.ev)
                     self._after_event(step.ev)
                 else:
@@ -630,6 +721,7 @@ class Runner:
                     self._advance_to(max(self.clock.now(), to_utc(p.at, self.tz)))
                 for ee in p.ev_after:
                     self._apply(ee)
+                self._before_wording(p, wi)
                 per[p.id].append(self._run_wording(p, wi, workdir))
             self.sut.rollback(snap)
             self.clock.advance((saved[0] - self.clock.now()).total_seconds())
@@ -637,6 +729,10 @@ class Runner:
         for p in chain:
             results[p.id] = self._probe_result(p, per[p.id])
         return [results[p.id] for p in chain]
+
+    def _before_wording(self, p: Probe, wording: str | None) -> None:
+        """Hook before one wording is graded (inside its snapshot). The gate run does nothing:
+        there the brain takes the wording itself; the bench lands a `tag: correction` wording."""
 
     def _flatten(self, probe: Probe) -> list[Probe]:
         out = [probe]

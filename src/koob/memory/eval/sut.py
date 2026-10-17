@@ -3,14 +3,28 @@
 `SUT` is the hook surface the harness needs beyond the public facade: seeding, worker control,
 snapshots for paraphrase isolation, derived-channel text, the dry-run hands log, fault injection.
 `ApiSUT` is the real thing: it drives `koob.memory.api` (the only entry, spec G13) against a
-tmp `memory.db`, and reads state through a small SQL inspector. A hook that does not exist yet
-raises `NotBuilt`, which the report shows as not built.
+tmp `memory.db`, and reads state through a small SQL inspector. A hook that is not built yet
+raises `NotBuilt`, which the report shows as "not built: <lane>".
+
+A replay of the same scenario must give the same store and the same answers, so `ApiSUT` takes
+away what the wall clock and thread timing decide in the app:
+- row ids (`ledger.new_id`) come in creation order from the scenario clock and a counter: a
+  ULID's random part orders ids minted in the same millisecond at random, and extract batches,
+  entities and facts are read `ORDER BY ... id`, which moved the extraction snapshots;
+- the finder deadlines are lifted (`EVAL_DEADLINE_MS`): a lane cut by a busy CPU returned
+  nothing on one run and its hits on the next (latency has its own tests);
+- the vector index is built and loaded in the caller's thread at every job pass and before
+  every probe (`scheduler.embed`), never by a background load a search kicks off;
+- `settle` waits until the label pass queue is really empty, including passes queued by a
+  pass that was running.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+import time
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -22,6 +36,7 @@ from .schema import Scenario
 
 SETTLE_S = 120.0  # the longest a label pass may keep a step waiting before the run fails
 WARM_S = 300.0  # the labeler warm-up wait, once per process (the embedder load is the slow part)
+EVAL_DEADLINE_MS = 10_000.0  # every finder deadline during a run: no lane is cut by CPU load
 
 
 def settle(timeout: float = SETTLE_S) -> None:
@@ -33,7 +48,40 @@ def settle(timeout: float = SETTLE_S) -> None:
     Every step therefore starts after the passes queued by the steps before it."""
     from .. import labeler
 
-    labeler.drain(timeout)
+    end = time.monotonic() + timeout
+    while True:
+        labeler.drain(max(0.0, end - time.monotonic()))
+        with labeler._jobs_lock:  # noqa: SLF001 - the queue a running pass may have grown
+            left = [f for f in labeler._jobs if not f.done()]  # noqa: SLF001
+        if not left:
+            return
+        if time.monotonic() >= end:
+            raise TimeoutError(f"{len(left)} label passes still queued after {timeout:.0f} s")
+
+
+class OrderedIds:
+    """`ledger.new_id` for a replay: a ULID whose time is the scenario clock (never going
+    back) and whose random part is a counter, so ids sort in creation order on every run."""
+
+    def __init__(self, clock: Clock | None) -> None:
+        self.clock = clock
+        self._ms = 0
+        self._n = 0
+        self._lock = threading.Lock()
+
+    def __call__(self) -> str:
+        from ..ledger import _CROCKFORD
+
+        with self._lock:
+            if self.clock is not None:
+                self._ms = max(self._ms, int(self.clock.now().timestamp() * 1000))
+            self._n += 1
+            n = (self._ms << 80) | self._n
+        out = []
+        for _ in range(26):
+            out.append(_CROCKFORD[n & 31])
+            n >>= 5
+        return "".join(reversed(out))
 
 
 def warm_labeler(lab: Any, timeout: float = WARM_S) -> bool:
@@ -415,6 +463,8 @@ class ApiSUT:
         self.conn: sqlite3.Connection | None = None
         self.workdir: Path | None = None
         self._names: dict[str, list[str]] = {}
+        self._real_new_id: Any = None
+        self._deadlines: dict[str, float] | None = None
 
     def start(self, scn: Scenario, clock: Clock, scheduler: Scheduler, workdir: Path) -> None:
         from .. import store as store_mod
@@ -422,10 +472,54 @@ class ApiSUT:
         settle()  # nothing queued by an earlier scenario may land in this one's time
         self.workdir, self._clock, self._scheduler = workdir, clock, scheduler
         self.api.clock = clock  # notices, denials and stamps carry scenario time, not today
+        self._pin_timing(clock)
         self.conn = store_mod.open(workdir / "memory" / "memory.db", home=workdir / "home")
         self._attach_vectors(workdir / "memory" / "vectors.db")
         self._configure_extract()
         self._install_labeler()
+        self.embed_now()  # an index (empty) in RAM before the first search: no background load
+
+    def _pin_timing(self, clock: Clock) -> None:
+        """Ids in creation order and finder deadlines out of reach (see the module doc)."""
+        from .. import ledger
+        from ..recall import basket
+
+        if self._real_new_id is None:
+            self._real_new_id = ledger.new_id
+        ledger.new_id = OrderedIds(clock)
+        if self._deadlines is None:
+            self._deadlines = dict(basket.FINDER_DEADLINES_MS)
+        basket.FINDER_DEADLINES_MS.update(
+            {k: max(v, EVAL_DEADLINE_MS) for k, v in self._deadlines.items()}
+        )
+
+    def _unpin_timing(self) -> None:
+        from .. import ledger
+        from ..recall import basket
+
+        if self._real_new_id is not None:
+            ledger.new_id, self._real_new_id = self._real_new_id, None
+        if self._deadlines is not None:
+            basket.FINDER_DEADLINES_MS.update(self._deadlines)
+            self._deadlines = None
+
+    def embed_now(self) -> None:
+        """Vectors for every record and raw message the store holds now, loaded into RAM in
+        this thread (`scheduler.embed`, which the app's job timer runs every tick). Called at
+        start and before each probe: in the app the timer ticks many times between a message
+        and a question asked hours later."""
+        from ..recall import vectors
+
+        if self.conn is None or not vectors.embedder_ready():
+            return  # no embedder in RAM (a unit test): nothing to embed with, nothing to load
+        from .. import clock as clockmod
+        from ..workers import scheduler as sched
+
+        if self._clock is None:
+            sched.embed(self.conn)
+            return
+        with clockmod.scoped(self._clock):
+            sched.embed(self.conn)
 
     @staticmethod
     def _attach_vectors(path: Path | None) -> None:
@@ -494,6 +588,7 @@ class ApiSUT:
             self.conn.close()
             self.conn = None
             self._attach_vectors(None)
+        self._unpin_timing()
 
     def store(self) -> Any:
         return self.conn
@@ -576,9 +671,12 @@ class ApiSUT:
                 labeler.finalize_pending(self.conn)
 
     def snapshot(self) -> Any:
+        """The store before a probe's wordings (each one rolls back to it). The job timer's
+        vector pass runs first, outside the rollback: what arrived is searchable by meaning."""
         if self.conn is None:
             return None
         settle()
+        self.embed_now()
         copy = sqlite3.connect(":memory:")
         self.conn.backup(copy)
         return copy

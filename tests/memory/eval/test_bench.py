@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 from koob.memory.eval import bench
 from koob.memory.eval.loader import load_set
-from koob.memory.eval.schema import Expect
+from koob.memory.eval.schema import Expect, Scenario
 
 DEV = Path(__file__).resolve().parents[3] / "evals" / "memory" / "dev"
 
@@ -155,3 +155,18 @@ def test_summarize_and_markdown():
     }
     md = bench.render_markdown(data)
     assert "| g | 50% |" in md and "plain 1x" in md and "forget x2" in md
+
+
+def test_an_e2e_only_probe_is_not_judged_at_memory_level(tmp_path):
+    from .helpers import PERSONAS, scenario_dict
+
+    d = scenario_dict()
+    d["probes"][0]["level"] = "e2e"
+    d["probes"].append({**d["probes"][0], "id": "p2", "level": "both"})
+    r = bench.BenchRunner(Scenario.model_validate(d), PERSONAS, sut=bench.PlainFileSUT())
+    res = r.run()
+    assert res.error is None, res.error
+    by = {p.id: p for p in res.probes}
+    assert by["p1"].status == "skip" and all(w.skipped for w in by["p1"].wordings)
+    assert by["p2"].status in ("pass", "fail")  # `both` still has its memory part judged
+    assert {rec["probe"] for rec in r.records} == {"p2"}

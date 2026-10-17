@@ -28,8 +28,8 @@ import logging
 import re
 import sqlite3
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
-from datetime import timedelta
+from dataclasses import dataclass, field, replace
+from datetime import date, datetime, timedelta
 from math import ceil
 from typing import Any
 
@@ -60,6 +60,7 @@ from ..model import (
     TurnCtx,
     TurnOrigin,
 )
+from ..recall import safe_text
 
 FREEZE_S = 60.0
 SAFETY_JOB = "safety_net"
@@ -561,7 +562,7 @@ def remember(
             trigger=trig,
             action={"text": (a.text_en if a else None) or text},
         )
-        armed = _arm(conn, intention)
+        armed = _arm(conn, intention, turn)
         if armed is not None:
             return armed
         record = intention.model_dump(mode="json", exclude_none=True)
@@ -595,8 +596,10 @@ def remember(
     return Written("committed", record_ids=[rid], memory_version=version, line=line)
 
 
-def _arm(conn: sqlite3.Connection, intention: Intention) -> Written | None:
-    """`intentions.arm` when built (it writes the record); None → the ADD path writes it."""
+def _arm(conn: sqlite3.Connection, intention: Intention, turn: TurnCtx) -> Written | None:
+    """intent's `arm` when built (it writes the record); None → the ADD path writes it.
+    The armed intention is stamped as this turn's write (§6.1: the safety net and the Stop
+    hook see the promise landed, as they see every other hot write)."""
     from .. import intentions
 
     try:
@@ -605,9 +608,17 @@ def _arm(conn: sqlite3.Connection, intention: Intention) -> Written | None:
         return None
     except (store.OpRejected, ValueError) as exc:
         return Written("rejected", line=str(exc) or "Не могу это поставить.")
-    return Written(
-        "committed", record_ids=[iid], memory_version=store.memory_version(conn), line="Запомнил."
-    )
+    version = store.memory_version(conn)
+    with store.write_tx(conn):
+        conn.execute(
+            "INSERT INTO served (thread_id, session_id, item_id, item_kind, version, turn_id, via,"
+            " created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                turn.thread_id, turn.session_id, iid, RecordKind.INTENTION.value, version,
+                turn.turn_id, ServedVia.WRITE.value, store.now(),
+            ),
+        )  # fmt: skip
+    return Written("committed", record_ids=[iid], memory_version=version, line="Запомнил.")
 
 
 def _reject_line(exc: Exception) -> str:
@@ -635,16 +646,39 @@ def _strip_fix_lead(text: str) -> str:
     return _FIX_LEAD.sub("", text or "").strip()
 
 
-# «не X, а Y» / «Y, а не X» / "not X but Y": the old value the user's correction names
-# and the new one
+# «не X, а Y» / «Y, а не X» / "not X but Y" / "Y, not X": the old value the user's correction
+# names and the new one. A clause keeps a time, a date or a decimal whole (14:20, 12.06, 10/14).
+_V, _END = ledger._V, ledger._END
 _CONTRAST = (
+    re.compile(rf"(?<!\w)не\s+(?P<old>{_V}+?)\s*[,—–-]?\s+а\s+(?P<new>{_V}+)", re.IGNORECASE),
+    re.compile(rf"(?P<new>{_V}+?)\s*,\s*а\s+не\s+(?P<old>{_V}+?){_END}", re.IGNORECASE),
+    re.compile(rf"(?<!\w)not\s+(?P<old>{_V}+?)\s*,?\s+but\s+(?P<new>{_V}+)", re.IGNORECASE),
+    # "15:40, not 14:20", "by Thursday, not Friday", "10/14 not 10/13": a value, then «not» + old
     re.compile(
-        r"(?<!\w)не\s+(?P<old>[^,;:.!?]+?)\s*[,—–-]?\s+а\s+(?P<new>[^,;:.!?]+)", re.IGNORECASE
+        rf"(?P<new>[^\s,;!?]+)(?P<sep>\s*[,—–]\s*|\s+)not\s+(?P<old>{_V}+?){_END}", re.IGNORECASE
     ),
-    re.compile(r"(?P<new>[^,;:.!?]+?)\s*,\s*а\s+не\s+(?P<old>[^,;:.!?]+)", re.IGNORECASE),
+)
+# "moved to Y", "pushed to Y", "it's Y now", «перенесли на Y», «теперь Y»: a correction that
+# names only the new value (the old one is the record it corrects)
+_SHIFT_WORD = (
+    r"(?:moved|pushed|postponed|rescheduled|changed|bumped|shifted|delayed|перенес\w*"
+    r"|перенёс\w*|сдвинул\w*|сдвинут\w*|передвинул\w*|поменял\w*|отложил\w*)"
+)
+_SHIFT = (
     re.compile(
-        r"(?<!\w)not\s+(?P<old>[^,;:.!?]+?)\s*,?\s+but\s+(?P<new>[^,;:.!?]+)", re.IGNORECASE
+        rf"(?<!\w){_SHIFT_WORD}(?:\s+(?:back|up|forward|again))?\s+(?:to|till|until|на)\s+"
+        rf"(?P<new>{_V}+?){_END}",
+        re.IGNORECASE,
     ),
+    re.compile(rf"(?<!\w)(?:it'?s|it\s+is)\s+(?P<new>{_V}+?)\s+now(?!\w)", re.IGNORECASE),
+    re.compile(rf"(?<!\w)now\s+(?:it'?s|it\s+is)\s+(?P<new>{_V}+?){_END}", re.IGNORECASE),
+    re.compile(rf"(?<!\w)теперь\s+(?P<new>{_V}+?){_END}", re.IGNORECASE),
+)
+# "the demo got pushed - it's wed 10/14": after a shift word, «it's Y» names the new value
+_SHIFTED_IS = re.compile(
+    rf"(?<!\w){_SHIFT_WORD}(?!\w).*?(?<!\w)(?:it'?s|it\s+is|it\s+will\s+be|будет)\s+"
+    rf"(?P<new>{_V}+?){_END}",
+    re.IGNORECASE,
 )
 # the user's own «я спутала», «я перепутал», «я ошиблась» after the correction: not the value
 _OWN_SLIP = re.compile(
@@ -663,13 +697,30 @@ class Contrast:
 
 
 def contrast(text: str | None) -> Contrast | None:
-    """The «не X, а Y» ("not X but Y") part of a correction: X is the value it retires, Y the
-    new one. Also «Y, а не X» and "not X but Y". None when the user's words hold no such
-    contrast."""
+    """The «не X, а Y» part of a correction: X is the value it retires, Y the new one. Also
+    «Y, а не X», "not X but Y" and "Y, not X" (a negated verb - "it is not ready",
+    "Dad not coming" - is no contrast). None when the words hold no such contrast."""
     for pat in _CONTRAST:
+        for m in pat.finditer(text or ""):
+            old, new = m.group("old").strip(" -—–"), m.group("new").strip(" -—–")
+            if not old or not new:
+                continue
+            if "sep" in pat.groupindex and (
+                new.casefold() in ledger._AUX
+                or (not re.search(r"[,—–]", m.group("sep")) and not re.search(r"\d", new))
+            ):
+                continue
+            return Contrast(old, new, m.start(), m.end())
+    return None
+
+
+def shifted(text: str | None) -> str | None:
+    """The new value of a correction that names only it: "moved to Friday", "it's 10/14 now",
+    "got pushed - it's wed 10/14 at 3", «перенесли на пятницу», «теперь в 15:00». None else."""
+    for pat in (*_SHIFT, _SHIFTED_IS):
         m = pat.search(text or "")
-        if m and m.group("old").strip() and m.group("new").strip():
-            return Contrast(m.group("old").strip(), m.group("new").strip(), m.start(), m.end())
+        if m and m.group("new").strip(" -—–"):
+            return m.group("new").strip(" -—–")
     return None
 
 
@@ -706,6 +757,53 @@ def _turn_raw(conn: sqlite3.Connection, turn: TurnCtx, quote: str) -> str | None
         if want and want in " ".join((text or "").casefold().split()):
             return str(rid)
     return None
+
+
+def _mask_written_raws(conn: sqlite3.Connection, record_id: str, turn: TurnCtx, ts: str) -> None:
+    """A record the hot path wrote («запомни…») carries no `source_raw_id` (the user's message is
+    ingested after the write), so once a fix retires it the raw lane had no lineage to mask
+    the user's old message by and quoted the retired value as current. The fix links the record
+    to the user's own raws of the turns that wrote it, those holding its quote, through
+    `raw_retractions` (the raw lane's lineage table). The fixing turn's own raw is the user's
+    new word, never masked here; a raw already linked to the record keeps its link."""
+    rec = conn.execute(
+        "SELECT r.origin_quote, f.quote_orig, f.value_norm, f.source_raw_id FROM records r"
+        " LEFT JOIN facts f ON f.id = r.id WHERE r.id = ?",
+        (record_id,),
+    ).fetchone()
+    if rec is None:
+        return
+    quotes = [
+        " ".join(q.casefold().split())
+        for q in (rec["origin_quote"], rec["quote_orig"])
+        if q and q.strip() and q.strip() != "(no quote)"
+    ]
+    if not quotes:
+        return
+    marks = ", ".join("?" * len(_MARK_KINDS))
+    rows = conn.execute(
+        "SELECT DISTINCT c.id, c.text FROM served s JOIN raw_chunks c ON c.turn_id = s.turn_id"
+        f" WHERE s.item_id = ? AND s.via = 'write' AND s.item_kind NOT IN ({marks})"
+        " AND c.status = 'active' AND c.author_tier IN (?, ?) AND c.turn_id IS NOT ?",
+        (
+            record_id,
+            *_MARK_KINDS,
+            AuthorTier.USER.value,
+            AuthorTier.USER_CONFIRMED.value,
+            turn.turn_id,
+        ),
+    ).fetchall()
+    for raw_id, text in rows:
+        if raw_id == rec["source_raw_id"]:
+            continue
+        said = " ".join((text or "").casefold().split())
+        if not any(q in said for q in quotes):
+            continue
+        conn.execute(
+            "INSERT OR IGNORE INTO raw_retractions (raw_id, record_id, retracted_value_norm,"
+            " created_at) VALUES (?, ?, ?, ?)",
+            (raw_id, record_id, rec["value_norm"] or "", ts),
+        )
 
 
 def _status(conn: sqlite3.Connection, rid: str) -> Status | None:
@@ -745,6 +843,7 @@ class _Target:
     id: str | None = None
     ask: str | None = None
     missing: str | None = None
+    also: tuple[str, ...] = ()  # more of the user's records holding the retired value
 
 
 def _slot_target(conn: sqlite3.Connection, a: Assertion) -> _Target | None:
@@ -783,8 +882,82 @@ def seed_fact(conn: sqlite3.Connection, rid: str) -> str | None:
     return rows[0][0] if len(rows) == 1 else None
 
 
+_HELD_ATTRS = ("value_text", "value_norm", "quote_orig", "text_en", "origin_quote")
+
+
+def retired_values(words: str | None) -> list[str]:
+    """The old values the user's correction retires: the ledger's reading of «не X, а Y» /
+    "Y, not X" (the same one that orders a late extraction), else this module's contrast."""
+    sides = ledger.retired_sides(words)
+    if not sides and (c := contrast(words)) is not None:
+        sides = [c.old]
+    return sides
+
+
+def _holders(conn: sqlite3.Connection, words: str, rids: Sequence[str]) -> list[str]:
+    """Slot heads among `rids` whose own value or words hold a value the user's correction
+    retires. Only the user's own records count: a tie never resolves onto someone else's claim."""
+    sides = retired_values(words)
+    if not sides:
+        return []
+    out: list[str] = []
+    for rid in dict.fromkeys(seed_fact(conn, r) or r for r in rids):
+        hd = head(conn, rid) or rid
+        rec = ledger.get_record(conn, hd)
+        if rec is None or rec.kind is RecordKind.ENTITY or hd in out:
+            continue
+        if AuthorTier(getattr(rec, "author_tier", AuthorTier.OTHER)) not in ledger.USER_TIERS:
+            continue
+        text = " ".join(str(v) for a in _HELD_ATTRS if (v := getattr(rec, a, None)))
+        if any(ledger.holds_value(s, text) for s in sides):
+            out.append(hd)
+    return out
+
+
+def _value_holders(
+    conn: sqlite3.Connection, words: str, held: Sequence[str], *, turn_words: str
+) -> list[str]:
+    """The holders whose own VALUE (not only their quote) is the value the user's «не X, а Y»
+    retires - each is a copy of the claim being corrected (one per message that stated it), so
+    the fix retires all of them instead of asking which. A record that only mentions X in its
+    words (a reason, a decision «из-за X») is a dependant: the cascade reviews it, never this.
+    Copies on several subjects count only when their words name each subject (or it is the
+    user); else [] and the caller asks as before."""
+    sides = retired_values(words)
+    if len(held) < 2 or not sides:
+        return []
+    out: list[tuple[str, str]] = []
+    for rid in held:
+        rec = ledger.get_record(conn, rid)
+        if rec is None or rec.kind not in (RecordKind.FACT, RecordKind.PREFERENCE):
+            continue
+        value = " ".join(
+            str(v) for a in ("value_text", "value_norm") if (v := getattr(rec, a, None))
+        )
+        if value and any(ledger.holds_value(s, value) for s in sides):
+            out.append((rid, str(getattr(rec, "subject_id", "") or "")))
+    if len(out) < 2:
+        return [rid for rid, _ in out] if len(out) == 1 else []
+    subjects = {subj for _, subj in out}
+    if len(subjects) > 1:
+        ws = policy.words(turn_words)
+        named = {
+            subj
+            for subj in subjects
+            if subj == "self" or policy.names_in(ws, policy._entity_names(conn, [subj]))
+        }
+        if named != subjects:
+            return []
+    return [rid for rid, _ in out]
+
+
 def resolve_target(
-    conn: sqlite3.Connection, target: str, because_quote: str, assertion: Assertion | None
+    conn: sqlite3.Connection,
+    target: str,
+    because_quote: str,
+    assertion: Assertion | None,
+    *,
+    thread_id: str | None = None,
 ) -> _Target:
     """§10.4 grammar for `fix`: handles first; then the assertion's slot; then the user's words,
     ranked lexically over usable and superseded records (the eval harness passes the user's
@@ -810,19 +983,39 @@ def resolve_target(
         return _Target(missing="Не понял, что исправить.")
     found = commands._find(conn, phrase, include_history=True, min_cover=0.0)
     scored = [(s, rid) for s, rid in found.scored if found.recs[rid].kind is not RecordKind.ENTITY]
-    if not scored:
+    if not scored:  # «нет, в среду»: the words name no record - the user's subject and value kind do
+        kin = list(
+            dict.fromkeys(
+                head(conn, r) or r
+                for r in commands.find_by_value_kind(conn, phrase, thread_id=thread_id)
+            )
+        )
+        if len(kin) == 1:
+            return _Target(id=kin[0])
+        if 1 < len(kin) <= 4:
+            return _Target(ask=_which(conn, kin))
         return _Target(missing="Не нашёл в памяти, что исправить.")
     best = scored[0][0]
+    held = _holders(conn, phrase, [rid for s, rid in scored if s >= best - 1.0])
+    if len(held) == 1:  # the user's «не X, а Y» names the record that holds X
+        return _Target(id=held[0])
+    every = _value_holders(conn, phrase, held, turn_words=target or because_quote)
+    if every:  # several of the user's records hold X as their value: the fix retires each one
+        return _Target(id=every[0], also=tuple(every[1:]))
     top = list(dict.fromkeys(seed_fact(conn, rid) or rid for s, rid in scored if s == best))
     heads = list(dict.fromkeys(head(conn, rid) or rid for rid in top))
     if len(heads) > 1:
-        opts = []
-        for rid in heads[:4]:
-            rec = ledger.get_record(conn, rid)
-            shown = getattr(rec, "quote_orig", None) or getattr(rec, "text_en", "") or rid
-            opts.append(f"«{shown[:80]}» [m:{rid}]")
-        return _Target(ask="Что именно исправить: " + " или ".join(opts) + "?")
+        return _Target(ask=_which(conn, heads))
     return _Target(id=top[0])
+
+
+def _which(conn: sqlite3.Connection, heads: Sequence[str]) -> str:
+    opts = []
+    for rid in heads[:4]:
+        rec = ledger.get_record(conn, rid)
+        shown = getattr(rec, "quote_orig", None) or getattr(rec, "text_en", "") or rid
+        opts.append(f"«{shown[:80]}» [m:{rid}]")
+    return "Что именно исправить: " + " или ".join(opts) + "?"
 
 
 def _new_from(
@@ -1090,9 +1283,35 @@ def _minted_by(conn: sqlite3.Connection, eid: str, claims: Sequence[str]) -> boo
 
 
 def _dependents(conn: sqlite3.Connection, rid: str) -> int:
+    return _dependents_of(conn, [rid])
+
+
+def _merged_copies(conn: sqlite3.Connection, rid: str) -> list[str]:
+    """The duplicates already merged into `rid` (a `supersedes` edge onto the same subject,
+    relation, value and polarity): what rested on them rests on the user's one claim, so a
+    correction of it reaches them too. An earlier value `rid` replaced is not a copy."""
+    return [
+        r[0]
+        for r in conn.execute(
+            "SELECT e.to_id FROM edges e JOIN facts a ON a.id = e.from_id"
+            " JOIN facts b ON b.id = e.to_id WHERE e.from_id = ? AND e.etype = 'supersedes'"
+            " AND a.subject_id = b.subject_id AND a.relation = b.relation"
+            " AND a.value_norm IS b.value_norm AND a.polarity = b.polarity",
+            (rid,),
+        )
+    ]
+
+
+def _dependents_of(conn: sqlite3.Connection, rids: Sequence[str]) -> int:
+    """How many records rest on any of these (one count when one rests on several)."""
+    ids = list(dict.fromkeys(rids))
+    if not ids:
+        return 0
+    marks = ", ".join("?" for _ in ids)
     row = conn.execute(
-        "SELECT count(DISTINCT target_record_id) FROM justifications WHERE member_record_id = ?",
-        (rid,),
+        "SELECT count(DISTINCT target_record_id) FROM justifications"  # noqa: S608
+        f" WHERE member_record_id IN ({marks}) AND target_record_id NOT IN ({marks})",
+        ids * 2,
     ).fetchone()
     return int(row[0]) if row else 0
 
@@ -1107,12 +1326,19 @@ def fix(
     assertion: Assertion | None = None,
     retract: bool = False,
 ) -> Written:
-    """§6.1 «исправь» / «это неправда» ("fix" / "that's not true"): retarget to the slot head
-    inside the transaction, SUPERSEDE (fix=true) or RETRACT; ledger invalidation and pending
-    updates; dependents via cascade when built; core hook; hot log.
+    """§6.1 «исправь» / «это неправда»: retarget to the slot head inside the transaction,
+    SUPERSEDE (fix=true) or RETRACT; ledger invalidation and pending updates; dependents
+    via cascade when built; core hook; hot log.
 
-    Tainted or non-owner turn (same rule as `commands.forget_now`): no correction word in the
-    user's own words → `ask_first`, before the target is even resolved."""
+    Tainted turn or a turn not from the user (the user-only rule 4, as `commands.forget_now`): no
+    correction word in the user's own words → `ask_first`, before the target is even resolved.
+
+    A cancel sent as a correction («отмени ужин в пятницу», "call off Friday's dinner") with
+    no new value cancels the plan it names (`commands.forget_now`, its own tainted rule);
+    not found there, it is corrected as usual."""
+    cancelled = _cancel(conn, (correction or "").strip() or because_quote, turn, because_quote)
+    if cancelled is not None:
+        return cancelled
     if _needs_his_word(turn) and not his_correction(policy.turn_words(turn)):
         return Written(
             "ask_first",
@@ -1122,12 +1348,27 @@ def fix(
         swap = _speaker_swap(conn, (correction or "").strip() or because_quote)
         if swap is not None:  # «я перепутала, это сказала Лера Пак»: the person, not the value
             return _reattribute(conn, swap, turn, because_quote=because_quote)
-    t = resolve_target(conn, target, because_quote, assertion)
+    t = resolve_target(conn, target, because_quote, assertion, thread_id=turn.thread_id)
     if t.missing:
         return Written("rejected", line=t.missing)
     if t.ask:
         return Written("ask_first", line=t.ask)
     assert t.id is not None
+    if t.also:  # every copy of the retired value, each by its own handle
+        said, deps = correction, _dependents_of(conn, [t.id, *t.also])
+        first = fix(
+            conn, f"m:{t.id}", said, turn,
+            because_quote=because_quote, assertion=assertion, retract=retract,
+        )  # fmt: skip
+        if first.outcome != "committed":
+            return first
+        ids, version = list(first.record_ids), first.memory_version
+        for aid in t.also:
+            w = fix(conn, f"m:{aid}", said, turn, because_quote=because_quote, retract=retract)
+            if w.outcome == "committed":
+                ids += [i for i in w.record_ids if i not in ids]
+                version = w.memory_version or version
+        return replace(first, record_ids=ids, dependents_to_review=deps, memory_version=version)
     t.id = seed_fact(conn, t.id) or t.id  # an episode's value lives in its seed fact
     st = _status(conn, t.id)
     if st in _GONE_LINE:
@@ -1182,6 +1423,11 @@ def fix(
                     op=OpKind.SUPERSEDE, target=hd, group=group,
                     payload={"record": data, "fix": True},
                 )  # fmt: skip
+        copies = (
+            [*ledger.carriers(ctx.conn, hd, exclude=(rid,)), *_merged_copies(ctx.conn, hd)]
+            if hd and not retract
+            else []
+        )
         touched = list(ledger.apply_op(ctx, op))
         version = ctx.version
         if not retract and hd is not None:
@@ -1192,8 +1438,11 @@ def fix(
         elif hd is not None:
             _serve_write(ctx, turn, hd, rec.kind.value)
         old = hd or t.id
-        box.update(op=op, v=version, old=old, touched=touched, deps=_dependents(ctx.conn, old))
-        _cascade(ctx, [old])
+        # the copies the ledger retired with it (`ledger.carriers`) carry dependants too
+        gone = [old, *(c for c in copies if _status(ctx.conn, c) is Status.SUPERSEDED)]
+        box.update(op=op, v=version, old=old, touched=touched, deps=_dependents_of(ctx.conn, gone))
+        _cascade(ctx, gone)
+        _mask_written_raws(ctx.conn, old, turn, ts)
         return touched
 
     try:
@@ -1222,6 +1471,40 @@ def fix(
         memory_version=box["v"],
         dependents_to_review=box["deps"],
         line=line,
+    )
+
+
+def _cancel(
+    conn: sqlite3.Connection, said: str, turn: TurnCtx, because_quote: str
+) -> Written | None:
+    """A cancel order with no new value (no «не X, а Y», no «перенеси на Y»): the plan it
+    names is cancelled the way «отмени» is (`commands.forget_now`, plan targets). None when
+    the words are not a plain cancel or name no plan: the correction path takes them.
+
+    A cancel said without the verb («ужин в пятницу отменяется», «встречу уже не надо»,
+    "never mind Friday's dinner") counts on the user's own untainted turn when it brings no
+    new value (one that does is a move or a fix, handled by the correction path)."""
+    from .. import commands
+
+    plain = safe_text.order_kind(said) == "cancel"
+    spoken = (
+        not plain
+        and commands.said_cancel(said)
+        and not commands._his_word_needed(turn)  # noqa: SLF001
+        and not commands.brings_new_value(said)
+    )
+    if not (plain or spoken) or contrast(said) or shifted(said):
+        return None
+    res = commands.forget_now(conn, said, turn=turn, because_quote=because_quote)
+    if res.outcome == "not_found":
+        return None
+    if res.outcome == "ask_first":
+        return Written("ask_first", line=res.line)
+    return Written(
+        "committed",
+        record_ids=list(res.record_ids),
+        memory_version=store.memory_version(conn),
+        line=res.line,
     )
 
 
@@ -1308,8 +1591,11 @@ def retracts(*texts: str | None) -> bool:
 
 
 def his_correction(words: str) -> bool:
-    """The user's own words carry a correction (the fix analogue of `commands._FORGET_VERB`)."""
-    return bool(words) and bool(_FIX_WORDS.search(words) or _CORRECTION.search(words))
+    """The user's own words carry a correction (the fix analogue of `commands._FORGET_VERB`): a
+    fix word, a correction phrase, or a «не X, а Y» / "Y, not X" contrast of any length."""
+    return bool(words) and bool(
+        _FIX_WORDS.search(words) or _CORRECTION.search(words) or contrast(words) is not None
+    )
 
 
 _FORGET = re.compile(
@@ -1332,12 +1618,40 @@ _PROMISE = re.compile(
     r"|i\s+will\s+(?:remind|check|send|follow\s+up))",
     re.IGNORECASE,
 )
+# what the net lands as the Cube's promise (wider than the freeze cue above: a promise it
+# can land never needs the freeze; one it cannot keeps the old behaviour)
+_PROMISE_LAND = re.compile(
+    rf"{_PROMISE.pattern}|(?:^|[\s,.!?:])(?:спрошу|пну|растормошу|уточню|подготовлю|соберу"
+    r"|позвоню|разбужу|подскажу|i'?ll\s+(?:ask|ping|nudge|text|prepare|make\s+sure)"
+    r"|i\s+will\s+(?:ask|ping|nudge))(?!\w)",
+    re.IGNORECASE,
+)
 _CLAIM = re.compile(
     r"(?:^|[\s,.!?«\"])(?:запомнил[аи]?|запомню|исправил[аи]?|поправил[аи]?|забыл[аи]?(?!\s+(?:про|о)\s)"
     r"|удалил[аи]?\s+из\s+памяти|перестал\w*\s+использовать|отменил[аи]?|noted|remembered"
     r"|i'?ll\s+remember|updated\s+(?:my\s+)?memory|forgot(?:ten)?\s+(?:it|that))(?!\w)",
     re.IGNORECASE,
 )
+
+
+# «не забудь», "don't forget": the opposite of a forget order (a reminder), never its cue;
+# so is a forget the user only fears: "nudge me if I forget", "in case I forget", «если вдруг забыть»
+_NOT_FORGET = re.compile(
+    r"(?<!\w)(?:не|never|not|don'?t|do\s+not)\s+(?:за|по)?(?:забудь|забыть|забывай|forget)\w*"
+    r"|(?<!\w)(?:if|in\s+case|when|before|so|lest)\s+(?:i|you|we)\s+(?:ever\s+|might\s+|do\s+)?"
+    r"forget\w*|(?<!\w)(?:если|вдруг|чтобы)\s+(?:я\s+|ты\s+)?(?:вдруг\s+)?(?:забыть|забуду)",
+    re.IGNORECASE,
+)
+
+
+# where a forget cue's clause starts (`_cue_text`): the plain forms and every colloquial one
+_FORGET_AT = re.compile(f"{_FORGET.pattern}|{safe_text.ORDER.pattern}", re.IGNORECASE)
+
+
+def _forget_cue(own: str) -> bool:
+    """The user's words order a forget or a cancel in any form (`safe_text.order_kind`: «выкинь из
+    головы», "scratch that", «отмени встречу»), or the plain forms `_FORGET` knows."""
+    return safe_text.order_kind(own) is not None or bool(_FORGET.search(_NOT_FORGET.sub(" ", own)))
 
 
 def detect(turn: TurnCtx, reply_text: str) -> list[str]:
@@ -1347,11 +1661,11 @@ def detect(turn: TurnCtx, reply_text: str) -> list[str]:
     own = policy.turn_words(turn) if turn.origin is TurnOrigin.OWNER else ""
     for name, pat in (
         ("correction", _CORRECTION),
-        ("forget", _FORGET),
+        ("forget", None),
         ("remember", _REMEMBER),
         ("constraint", _CONSTRAINT),
     ):
-        if own and pat.search(own):
+        if own and (_forget_cue(own) if pat is None else pat.search(own)):
             cues.append(name)
     if reply_text and _PROMISE.search(reply_text):
         cues.append("promise")
@@ -1445,7 +1759,7 @@ def _cue_text(words: str, cues: Sequence[str]) -> str:
     """The clauses of `words` that belong to `cues` (only their entities get frozen)."""
     pats = {
         "correction": _CORRECTION,
-        "forget": _FORGET,
+        "forget": _FORGET_AT,
         "remember": _REMEMBER,
         "constraint": _CONSTRAINT,
     }
@@ -1544,11 +1858,125 @@ def frozen_records(conn: sqlite3.Connection) -> set[str]:
     return out
 
 
+# What the net lands itself, in the turn (probes and the next answer come before any
+# worker). «запомни» as a whole word with its content after it; a promise is the reply's
+# sentence that holds it, kept only when it says about what (not «напомню завтра»).
+_REMEMBER_AT = re.compile(
+    r"(?<!\w)(?:запомни|имей\s+в\s+виду|remember\s+(?:that|this)|note\s+that)(?!\w)"
+    r"(?:\s*[:,—–-])?\s*",
+    re.IGNORECASE,
+)
+_SENTENCE = re.compile(r"[^.!?\n]+[.!?]?")
+_FILLER = re.compile(
+    r"(?:хорошо|ладно|окей|ок|ага|договорились|конечно|обязательно|тогда|тебе|тебя|потом|позже"
+    r"|скоро|завтра|сегодня|послезавтра|вечером|утром|днём|днем|ночью|через|минут\w*|час\w*"
+    r"|понедельник\w*|вторник\w*|сред\w*|четверг\w*|пятниц\w*|суббот\w*|воскресень\w*"
+    r"|sure|okay|ok|will|do|you|your|it|that|this|then|later|soon|tomorrow|tonight|today"
+    r"|morning|evening|night|afternoon|minutes?|hours?|monday|tuesday|wednesday|thursday"
+    r"|friday|saturday|sunday|got|and|the|about|again)",
+    re.IGNORECASE,
+)
+
+
+def _promise_clause(reply_text: str) -> str | None:
+    """The reply's sentence holding the Cube's promise, when it says what it is about."""
+    for m in _SENTENCE.finditer(reply_text or ""):
+        sent = m.group(0).strip()
+        hit = _PROMISE_LAND.search(sent)
+        if hit is None:
+            continue
+        rest = (sent[: hit.start()] + " " + sent[hit.end() :]).casefold()
+        if any(len(w) > 2 and not _FILLER.fullmatch(w) for w in re.findall(r"[^\W\d_]+", rest)):
+            return sent.split(":", 1)[1].strip() if ":" in sent[:30] else sent
+    return None
+
+
+_WEEKDAYS = (
+    ("понедельник", "monday"), ("вторник", "tuesday"), ("сред[аеуы](?!\\w)", "wednesday"),
+    ("четверг", "thursday"), ("пятниц", "friday"), ("суббот", "saturday"),
+    ("воскресень", "sunday"),
+)  # fmt: skip
+_NEXT_DAY = re.compile(r"(?<!\w)(?:завтра|tomorrow)(?!\w)", re.IGNORECASE)
+_THIS_DAY = re.compile(r"(?<!\w)(?:сегодня|today|tonight)(?!\w)", re.IGNORECASE)
+
+
+def _due_of(text: str, clock: str) -> str | None:
+    """The day a promise names (YYYY-MM-DD), from the turn's day: an explicit date, a
+    weekday (its next one), «завтра» / "tomorrow", «сегодня» / "tonight". None: no day."""
+    try:
+        today = datetime.fromisoformat(clock.replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+    low = text.casefold()
+    for pat, md in (
+        (ledger._ISO, lambda m: (int(m[1]), int(m[2]), int(m[3]))),
+        (ledger._DAY_MONTH, lambda m: (int(m[3] or 0), ledger._MONTHS[m[2]], int(m[1]))),
+        (ledger._MONTH_DAY, lambda m: (int(m[3] or 0), ledger._MONTHS[m[1]], int(m[2]))),
+    ):
+        m = pat.search(low)
+        if m is None:
+            continue
+        try:
+            y, mo, d = md(m)
+            day = date(y or today.year, mo, d)
+        except (KeyError, ValueError):
+            continue
+        if not m.groups()[-1] and day < today:
+            day = date(today.year + 1, mo, d)
+        return day.isoformat()
+    for n, stems in enumerate(_WEEKDAYS):
+        if any(re.search(rf"(?<!\w){s}\w*", low) for s in stems):
+            return (today + timedelta(days=(n - today.weekday()) % 7 or 7)).isoformat()
+    if _NEXT_DAY.search(low):
+        return (today + timedelta(days=1)).isoformat()
+    if _THIS_DAY.search(low):
+        return today.isoformat()
+    return None
+
+
+def land_in_turn(
+    conn: sqlite3.Connection, turn: TurnCtx, reply_text: str, cues: Sequence[str]
+) -> bool:
+    """Land the cues code can land, in the turn, as the brain's call would have: the user's
+    correction with a new value (one target), the user's «запомни …», the Cube's promise. The
+    user's own untainted turns only (foreign text is never the user's); a forget cue lands
+    nothing here (the forget path owns it). True when something committed."""
+    if turn.is_tainted or turn.origin not in (TurnOrigin.OWNER, TurnOrigin.TASK):
+        return False
+    own = policy.turn_words(turn).strip()
+    if not own or "forget" in cues:
+        return False
+    done = False
+    try:
+        if "correction" in cues and (contrast(own) is not None or shifted(own)):
+            t = resolve_target(conn, own, own, None, thread_id=turn.thread_id)
+            if t.id is not None and not t.ask and not t.missing:
+                done |= fix(conn, own, own, turn, because_quote=own).outcome == "committed"
+        m = _REMEMBER_AT.search(own) if "remember" in cues else None
+        if m is not None and len(own[m.end() :].split()) >= 2:
+            text = own[m.end() :].strip()
+            done |= remember(conn, text, turn, because_quote=own).outcome == "committed"
+        clause = _promise_clause(reply_text) if "promise" in cues else None
+        due = _due_of(clause, turn.clock or _now()) if clause else None
+        if clause and due:  # the Cube's open loop with its day: the core shows it
+            a = Assertion(subject="cube", text_en=clause, due=due)
+            w = remember(conn, clause, turn, because_quote=own, kind=RecordKind.LOOP, assertion=a)
+            done |= w.outcome == "committed"
+    except (sqlite3.Error, store.OpRejected, ValueError) as exc:
+        log.warning("memory hot: in-turn landing failed: %s", type(exc).__name__)
+    return done
+
+
 def after_turn_check(
     conn: sqlite3.Connection, turn: TurnCtx, reply_text: str
 ) -> tuple[bool, list[str], str | None]:
-    """§6.1 safety net: cues with no matching commit → freeze + urgent job."""
+    """§6.1 safety net: cues with no matching commit first land on the hot path when code
+    can land them (`land_in_turn`); the rest → freeze + urgent job."""
     cues = unbacked_cues(conn, turn, detect(turn, reply_text))
+    wide = [] if "promise" in cues or not _PROMISE_LAND.search(reply_text or "") else ["promise"]
+    wide = unbacked_cues(conn, turn, wide)
+    if (cues or wide) and land_in_turn(conn, turn, reply_text, [*cues, *wide]):
+        cues = unbacked_cues(conn, turn, cues)
     if not cues:
         return False, [], None
     words = _cue_text(policy.turn_words(turn), cues)

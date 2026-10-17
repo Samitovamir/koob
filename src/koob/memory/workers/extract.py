@@ -134,6 +134,10 @@ def snapshot(conn: sqlite3.Connection, raw_ids: list[str]) -> tuple[dict[str, An
     words = {w for raw in raws for w in norm(raw["text"]).split()}
     joined = " ".join(norm(raw["text"]) for raw in raws)
     ent_ids = {OWNER_ENTITY_ID} | {raw["speaker"] for raw in raws if raw["speaker"]}
+    from .. import entities as names_
+
+    forms = {b for w in words for b in names_.name_bases(w)} - words  # «Тёмин» → «тёма»
+    form_ids: set[str] = set()
     for eid, alias in conn.execute(
         "SELECT a.entity_id, a.alias_norm FROM aliases a JOIN records r ON r.id = a.entity_id"
         " WHERE r.status IN ('active', 'archived')"
@@ -141,6 +145,8 @@ def snapshot(conn: sqlite3.Connection, raw_ids: list[str]) -> tuple[dict[str, An
         a = norm(alias)
         if a and (a in words or (" " in a and a in joined)):
             ent_ids.add(eid)
+        elif a and a in forms:
+            form_ids.add(eid)
     entities: list[dict[str, Any]] = []
     facts: list[dict[str, Any]] = []
     if ent_ids:
@@ -252,7 +258,64 @@ def snapshot(conn: sqlite3.Connection, raw_ids: list[str]) -> tuple[dict[str, An
         "intentions": intentions,  # dedup in code only: never in the model's input
         "relations": relations,
     }
+    # code only, never in the model's input: people the batch names only in another
+    # form («Тёмин день рождения» for Тёма), so build() binds a person the model mints under
+    # that name to them instead of minting a duplicate. Absent when there are none, so a
+    # snapshot without such names is byte-identical to before (replay caches key on it).
+    if form := _form_entities(conn, sorted(form_ids - ent_ids)):
+        snap["form_entities"] = form
     return snap, read_set_of(snap)
+
+
+def _form_entities(conn: sqlite3.Connection, ids: list[str]) -> list[dict[str, Any]]:
+    if not ids:
+        return []
+    q = _in(len(ids))
+    names: dict[str, set[str]] = {}
+    for eid, a in conn.execute(
+        f"SELECT entity_id, alias_norm FROM aliases WHERE entity_id IN ({q})",  # noqa: S608
+        ids,
+    ):
+        names.setdefault(eid, set()).add(norm(a))
+    return [
+        {
+            "id": eid,
+            "etype": etype,
+            "display_name": name,
+            "version": int(ver),
+            "names": sorted(names.get(eid, set()) | {norm(name)}),
+        }
+        for eid, etype, name, ver in conn.execute(
+            "SELECT e.id, e.etype, e.display_name, r.version FROM entities e"
+            f" JOIN records r ON r.id = e.id WHERE e.id IN ({q})"  # noqa: S608
+            " AND r.status IN ('active', 'archived') ORDER BY e.id",
+            ids,
+        )
+    ]
+
+
+def _form_entity(e: Any, snap: dict[str, Any]) -> str | None:
+    """The stored person a newly minted single-word name is a form of («Тёма» minted
+    from «Тёмин день рождения» while Тёма was out of the model's view). Exactly one stored
+    entity of that etype must carry the name, and no entity of that name may be in the
+    model's view (there the model chose a new person: a namesake stays apart). A name with
+    a surname or a second word is never bound here."""
+    from .. import entities
+
+    cands = snap.get("form_entities") or []
+    n = norm(e.display_name)
+    if not cands or not n or " " in n:
+        return None
+    keys = {n, *entities.name_bases(n)}
+    etype = e.etype or "thing"
+    hits = [c for c in cands if c["etype"] == etype and keys & set(c["names"])]
+    if len(hits) != 1:
+        return None
+    for k in snap.get("entities", []):
+        kn = norm(k["display_name"])
+        if k["etype"] == etype and keys & {kn, *entities.name_bases(kn)}:
+            return None
+    return str(hits[0]["id"])
 
 
 def cloud_safe_fact(f: dict[str, Any]) -> bool:
@@ -279,6 +342,7 @@ def cloud_safe(snap: dict[str, Any]) -> dict[str, Any]:
 def read_set_of(snap: dict[str, Any]) -> list[ReadRef]:
     refs = [ReadRef(id=r["id"], version=r["rev"], src=ReadSrc.RAW) for r in snap.get("raws", [])]
     refs += [ReadRef(id=e["id"], version=e["version"]) for e in snap.get("entities", [])]
+    refs += [ReadRef(id=e["id"], version=e["version"]) for e in snap.get("form_entities", [])]
     refs += [ReadRef(id=f["id"], version=f["version"]) for f in snap.get("facts", [])]
     refs += [ReadRef(id=d["id"], version=d["version"]) for d in snap.get("decisions", [])]
     return refs
@@ -364,6 +428,17 @@ def _value_words(text: str | None) -> list[str]:
     return [w for w in norm(text).split() if len(w) >= 3 and not w.isdigit()]
 
 
+_DIGITS = re.compile(r"(?<!\d)\d+(?!\d)")
+
+
+def _same_numbers(want: set[str], have: set[str], value: str, text: str) -> bool:
+    """The value's plain numbers are the text's own digits even where the text's order
+    reads them as a date («Точка с января 12 тысяч»: «января 12» parses as 12 January);
+    its dates, contacts and handles must still be the text's own."""
+    rest = {t for t in want if not t.startswith("num:")}
+    return rest <= have and set(_DIGITS.findall(value)) <= set(_DIGITS.findall(text))
+
+
 def _holds(text: str, value: str | None, names: list[list[str]]) -> bool:
     """`text` holds the value: its dates, numbers and contacts, every content word of
     `value_text`, and one of the value entity's names (each a list of name variants)."""
@@ -371,7 +446,8 @@ def _holds(text: str, value: str | None, names: list[list[str]]) -> bool:
 
     skels = {_skel(w) for w in norm(text).split()}
     if value:
-        if not ledger.value_tokens(value) <= ledger.value_tokens(text):
+        want, have = ledger.value_tokens(value), ledger.value_tokens(text)
+        if not want <= have and not _same_numbers(want, have, value, text):
             return False
         if not all(_word_in(w, skels) for w in _value_words(value)):
             return False
@@ -472,10 +548,15 @@ def build(x: Extraction, snap: dict[str, Any]) -> Built:
     def verbatim(quote: str, rid: str) -> bool:
         return bool(quote.strip()) and norm(quote) in raw_norm[rid]
 
+    away, dead_in = _corrected_away(x, raw_norm)
+    for ref in away:
+        out.dropped.append(f"corrected_away:{ref}")
+
     # entities: a local ref → a deterministic id from the batch and the normalized name
     local_e: dict[str, str] = {}
     ent_raws: dict[str, list[str]] = {}
     placeholders: set[str] = set()  # names no message carries: the model's own words
+    bound: set[str] = set()  # refs bound to a stored person by a name form
     for e in x.entities:
         if entities.code_like(e.display_name):  # a code is never a name
             out.dropped.append(f"code_name:{e.ref}")
@@ -483,6 +564,10 @@ def build(x: Extraction, snap: dict[str, Any]) -> Built:
         if not _grounded([e.display_name, *e.aliases], raw_norm.values(), all_skels):
             placeholders.add(e.ref)
             out.dropped.append(f"ungrounded_name:{e.ref}")
+            continue
+        if (stored := _form_entity(e, snap)) is not None:
+            local_e[e.ref] = stored  # the user's Тёма, named here only as «Тёмин»: no duplicate
+            bound.add(e.ref)
             continue
         eid = _hid("e", batch, norm(e.display_name))
         local_e[e.ref] = eid
@@ -523,7 +608,7 @@ def build(x: Extraction, snap: dict[str, Any]) -> Built:
 
     entity_ops: dict[str, ProposalOp] = {}
     for e in x.entities:
-        if e.ref not in local_e:
+        if e.ref not in local_e or e.ref in bound:
             continue
         eid = local_e[e.ref]
         if eid in entity_ops:
@@ -547,12 +632,13 @@ def build(x: Extraction, snap: dict[str, Any]) -> Built:
             if a.strip() and norm(a) not in seen and not entities.code_like(a):
                 seen.add(norm(a))
                 aliases.append(AliasIn(alias=a.strip()))
-        for w in e.kind_words:  # «мой кот Бублик»: «к коту» reaches «Бублик» (MEM-WHY #8)
+        for w in e.kind_words:  # «мой кот Бублик»: «к коту» reaches Бублик (the pet example)
             if (
                 w.strip()
                 and norm(w) not in seen
                 and not entities.code_like(w)
                 and _grounded([w], raw_norm.values(), all_skels)
+                and not dead_in(w)  # «а не Ира, соседка»: the corrected-away side names no one
             ):
                 seen.add(norm(w))
                 aliases.append(AliasIn(alias=w.strip(), kind=AliasKind.NICKNAME))
@@ -565,8 +651,20 @@ def build(x: Extraction, snap: dict[str, Any]) -> Built:
         )
         gs.find(eid)
 
-    facts = _corrections(list(x.facts), raws, known_f, x_names, who, fam, out)
+    facts = [f for f in x.facts if f.ref not in away]
+    facts = _corrections(facts, raws, known_f, x_names, who, fam, out)
+    facts = _omitted_replaces(facts, raws, known_f, who, out)
 
+    person_names = [  # whom «для Лены» / "for Kate" may name: people, never the user
+        str(e["display_name"])
+        for e in snap.get("entities", [])
+        if e.get("etype") in ("person", "pet") and e.get("id") != OWNER_ENTITY_ID
+    ] + [
+        n
+        for e in x.entities
+        if e.etype in ("person", "pet") and e.ref not in (OWNER_ENTITY_ID, f"m:{OWNER_ENTITY_ID}")
+        for n in (e.display_name, *e.aliases)
+    ]
     new_facts: dict[str, str] = {}  # fact ref -> id (only facts that passed)
     fact_ops: list[tuple[str, ProposalOp]] = []
     pending: list[tuple[XFact, str, dict[str, Any], list[str]]] = []
@@ -625,6 +723,7 @@ def build(x: Extraction, snap: dict[str, Any]) -> Built:
             "author_tier": tier.value,
         }
         rec = {k: v for k, v in rec.items() if v is not None}
+        _settle_words(rec, raw["text"], person_names, known_f.values())
         try:
             ledger.parse_record(rec, ts="1970-01-01T00:00:00Z")
         except ledger.CommitRejected:
@@ -818,6 +917,22 @@ def build(x: Extraction, snap: dict[str, Any]) -> Built:
             if e in entity_ops:
                 gs.union(group, e)
         justs = justs_of(d.ref, d.reasons, own, group, reads)
+        have = {j.member for j in justs}
+        for f, fid, frec, _ents in pending:  # «X, так что Y» in one message: X backs Y
+            if fid in have or f.source_raw_id != d.source_raw_id:
+                continue
+            if not reason_of(raw_norm.get(d.source_raw_id, ""), f.quote_orig, d.quote_orig):
+                continue
+            stated = own and AuthorTier(frec["author_tier"]) in OWN_TIERS
+            gs.union(group, frec["subject_id"])  # the reason commits with its decision
+            justs.append(
+                JustificationIn(
+                    member=fid,
+                    provenance=Provenance.STATED if stated else Provenance.INFERRED,
+                    group_no=0,
+                )
+            )
+            have.add(fid)
         matches = []
         if d.replaces:  # §8.3: a model match flags the old one for review
             old = known_d.get(d.replaces) or known_f.get(d.replaces)
@@ -982,11 +1097,276 @@ def build(x: Extraction, snap: dict[str, Any]) -> Built:
         if op is not None:
             crit_ops.append((key, op))
 
+    others = [*fact_ops, *imp_ops, *dec_ops, *int_ops, *crit_ops]
+    used = " ".join(json.dumps(op.payload, default=str) for _k, op in others)
+    for e in x.entities:  # named only on a corrected-away side and by no kept record
+        eid = local_e.get(e.ref)
+        if eid in entity_ops and eid not in used and dead_in(e.display_name, *e.aliases):
+            del entity_ops[eid]
+            out.dropped.append(f"corrected_away_entity:{e.ref}")
     for eid, op in entity_ops.items():
         out.ops.append(op.model_copy(update={"group": gs.find(eid)}))
-    for key, op in [*fact_ops, *imp_ops, *dec_ops, *int_ops, *crit_ops]:
+    for key, op in others:
         out.ops.append(op.model_copy(update={"group": gs.find(key)}))
     return out
+
+
+# ---------------------------------------------------------------- the user's words settle the fact
+# Post-processing of one fact record from the words of its own clause: who it is for, whether
+# it is just this once, and the scale a bare amount implies. Never the model's input: the
+# value_text stays the model's (later batches read it), only code-side fields change.
+
+_CLAUSE_SPLIT = re.compile(r"[,;.!?\n—–]|\s(?:но|а|и|зато|but|and|while|whereas|though)\s", re.I)
+_POSS = r"(?:(?:мо|тво|сво|наш|ваш)(?:ей|его|их|ему|им|ей)\s+|(?:my|his|her|our|your|the)\s+)?"
+_KIN_GEN = (
+    r"мам(?:ы|очки|ули)|пап(?:ы|очки)|сестр(?:ы|енки|ёнки)|брат(?:а|ишки)|жены|мужа|сына|доч(?:ки|ери)"
+    r"|реб[её]нка|детей|бабушки|дедушки|деда|друга|друзей|подруги|коллег(?:и)?|начальника|шефа"
+    r"|гостей|племянни(?:ка|цы)|внук(?:а|ов)|внучки|девушки|парня|соседа|соседки|родителей"
+    r"|т[её]щи|свекрови|него|не[её]|них"
+)
+_KIN_DAT = (
+    r"мам(?:е|очке)|пап(?:е|очке)|сестр(?:е|енке|ёнке)|брату|жене|мужу|сыну|доч(?:ке|ери)"
+    r"|реб[её]нку|детям|бабушке|дедушке|деду|другу|друзьям|подруге|коллег(?:е|ам)|начальнику"
+    r"|шефу|гостям|племянни(?:ку|це)|внуку|внучке|девушке|парню|соседу|соседке|родителям"
+)
+_KIN_EN = (
+    r"mom|mum|mother|dad|father|sister|brother|wife|husband|son|daughter|kids?|children|child"
+    r"|baby|grandma|grandmother|grandpa|grandfather|friends?|girlfriend|boyfriend|partner"
+    r"|colleagues?|boss|guests?|nephew|niece|parents|roommate|neighbou?r|in-laws"
+)
+_FOR_OTHER = (
+    re.compile(rf"(?<!\w)для\s+{_POSS}(?P<who>{_KIN_GEN})(?!\w)", re.I),
+    re.compile(
+        rf"(?<!\w)for\s+{_POSS}(?:little\s+|older\s+|younger\s+|baby\s+)?(?P<who>{_KIN_EN})(?!\w)",
+        re.I,
+    ),
+    re.compile(r"(?<!\w)for\s+(?P<who>him|her|them)(?!\w)", re.I),
+)
+_GIVE_VERB = re.compile(
+    r"(?<!\w)(?:бер[уёе]\w*|брал\w*|взял\w*|покупа\w*|купил\w*|куплю|купить|закаж\w*|заказыва\w*"
+    r"|готовлю|готовит\w*|приготов\w*|дар[юи]\w*|подар\w*|вез[уё]\w*|привез\w*|привож\w*)(?!\w)",
+    re.I,
+)
+_DAT_OTHER = re.compile(rf"(?<!\w){_POSS}(?P<who>{_KIN_DAT})(?!\w)", re.I)
+_NAME_AFTER = re.compile(r"(?<!\w)(?:для|for)\s+(?P<who>[A-ZА-ЯЁ][\w'-]+)")
+_SELF_WORDS = frozenset(("себя", "себе", "меня", "мне", "myself", "me", "us", "нас"))
+
+
+# A connective that ties a reason to its consequence inside one message. Reason
+# first: «X, так что Y», «X, поэтому Y», "X, so Y", "X, that's why Y". Reason after:
+# «Y, потому что X», «Y из-за X», "Y because X". English «so» counts only after a comma,
+# a dash or a semicolon («so far», "I think so" are no connective).
+_THEN = re.compile(
+    r"(?<!\w)(?:так\s+что|поэтому|вот\s+почему|из-за\s+этого|потому\s+и)(?!\w)"
+    r"|[,;—–]\s*so(?!\w)|(?<!\w)(?:that's|that\s+is|which\s+is)\s+why(?!\w)"
+    r"|(?<!\w)(?:therefore|hence)(?!\w)",
+    re.IGNORECASE,
+)
+_SINCE = re.compile(
+    r"(?<!\w)(?:потому\s+что|так\s+как|из-за(?!\s+этого)|because|due\s+to)(?!\w)", re.IGNORECASE
+)
+
+
+def reason_of(text: str, reason_quote: str | None, decision_quote: str | None) -> bool:
+    """Does this message state `reason_quote` as the reason of `decision_quote`: both are
+    verbatim in it, the reason wholly on the cause side of one connective and the choice
+    reaching into its other side."""
+    t, r, d = norm(text), norm(reason_quote), norm(decision_quote)
+    if not t or not r or not d or r == d:
+        return False
+    ri, di = t.find(r), t.find(d)
+    if ri < 0 or di < 0:
+        return False
+    for pat, reason_first in ((_THEN, True), (_SINCE, False)):
+        for m in pat.finditer(t):
+            if reason_first:  # X ends before «так что»; the choice reaches past it
+                ok = ri + len(r) <= m.start() and di + len(d) > m.end()
+            else:  # the choice starts before «потому что»; X starts after it
+                ok = di < m.start() and ri >= m.end()
+            if ok:
+                return True
+    return False
+
+
+def _clauses(text: str) -> list[str]:
+    return [c for c in _CLAUSE_SPLIT.split(text or "") if c and c.strip()]
+
+
+def _stem_set(text: str | None) -> set[str]:
+    return {w[: max(4, len(w) - 2)] for w in re.findall(r"[^\W\d_]{4,}", norm(text))}
+
+
+def _value_clauses(quote: str, value: str | None) -> list[str]:
+    """The clauses of the user's quote that hold the value; the whole quote when none does (a
+    quote of one clause, or a value in other words)."""
+    parts = _clauses(quote)
+    stems = _stem_set(value)
+    hold = [c for c in parts if stems and _stem_set(c) & stems]
+    return hold or ([quote] if len(parts) <= 1 else [])
+
+
+def _named(word: str, names: Iterable[str]) -> bool:
+    w = norm(word)
+    for n in names:
+        for part in norm(n).split():
+            if len(part) >= 3 and w.startswith(part[: max(3, len(part) - 1)]):
+                return True
+    return False
+
+
+def for_other(quote: str, value: str | None, names: Iterable[str] = ()) -> str | None:
+    """Whom the user's own fact is for, by the words of the value's clause:
+    «беру овсяное для сестры», "I get decaf for my dad", «маме покупаю мёд», «для Лены»
+    (a known person). None: the user's own."""
+    names = list(names)
+    for clause in _value_clauses(quote, value):
+        for pat in _FOR_OTHER:
+            m = pat.search(clause)
+            if m and norm(m.group("who")) not in _SELF_WORDS:
+                return m.group(0).strip()
+        if _GIVE_VERB.search(clause):
+            m = _DAT_OTHER.search(clause)
+            if m:
+                return m.group(0).strip()
+        for m in _NAME_AFTER.finditer(clause):
+            if _named(m.group("who"), names):
+                return m.group(0).strip()
+    return None
+
+
+_ONCE = re.compile(
+    r"(?<!\w)(?:сегодня|сегодняшн\w*|этим\s+вечером|в\s+этот\s+раз|на\s+этот\s+раз|разок"
+    r"|только\s+сегодня|today|tonight|this\s+time|just\s+this\s+once|for\s+once|this\s+evening)(?!\w)",
+    re.I,
+)
+_LASTING = re.compile(
+    r"(?<!\w)(?:теперь|отныне|с\s+(?:этого|сегодняшнего)\s+дня|с\s+сегодня|больше\s+не|уже\s+не"
+    r"|всегда|обычно|каждый|каждую|каждое|по\s+(?:утрам|вечерам|выходным)|никогда|впредь"
+    r"|from\s+now\s+on|starting\s+today|no\s+longer|any\s*more|always|usually|every|never"
+    r"|these\s+days|nowadays|from\s+today|понял\w*|узнал\w*|осознал\w*|решил\w*"
+    r"|realized|realised|found\s+out|learned|decided)(?!\w)",
+    re.I,
+)
+_CONTRAST = re.compile(r"(?<!\w)(?:вместо|а\s+не|instead|rather\s+than|not)(?!\w)", re.I)
+
+
+def just_once(quote: str, value: str | None, *, preference: bool) -> bool:
+    """«Сегодня не хочу кинзу», "tonight I'll skip dessert": the value's clause says it is
+    for this time only and nothing in it says it lasts. A fact (not a taste) also needs a
+    contrast («вместо», "instead") to read as an exception to a standing habit."""
+    for clause in _value_clauses(quote, value):
+        once = _ONCE.search(clause) and not _LASTING.search(quote)
+        if once and (preference or _CONTRAST.search(clause)):
+            return True
+    return False
+
+
+_HALF = (
+    (re.compile(r"(?<!\w)полтор(?:а|ы)(?!\w)", re.I), 1.5),
+    (re.compile(r"(?<!\w)one\s+and\s+a\s+half(?!\w)", re.I), 1.5),
+    (re.compile(r"(?<!\w)(?:два|две)\s+с\s+половиной(?!\w)", re.I), 2.5),
+    (re.compile(r"(?<!\w)три\s+с\s+половиной(?!\w)", re.I), 3.5),
+    (re.compile(r"(?<!\w)two\s+and\s+a\s+half(?!\w)", re.I), 2.5),
+    (re.compile(r"(?<![\w.,])(\d{1,2}[.,]\d)(?![\w.,])"), None),
+)
+_WORDY = frozenset(
+    (
+        "полтора",
+        "полторы",
+        "one",
+        "and",
+        "a",
+        "half",
+        "два",
+        "две",
+        "три",
+        "с",
+        "половиной",
+        "two",
+        "three",
+    )
+)
+_MONEY = re.compile(
+    r"(?i)^[\s$€₽£]*(?:\d{1,2}[.,]\d|[^\W\d_]+(?:\s+[^\W\d_]+)*)\s*(?:\$|€|₽|£|руб\w*|р\.?|доллар\w*|бакс\w*"
+    r"|евро|dollars?|bucks|usd|eur|rub\w*)?\s*$"
+)
+_SCALED = re.compile(
+    r"(?<!\w)\d+(?:[.,]\d+)?\s*(?:тыс\w*|k|к|thousand|grand)(?!\w)|(?<![\d.,])\d{1,3}(?:[  ,]\d{3})+(?!\d)"
+    r"|(?<![\d.,])\d{4,}(?![\d.,])|(?<!\w)(?:тысяч\w*|тыщ\w*|косар\w*|thousands?|grand)(?!\w)",
+    re.I,
+)
+
+
+def _plain_words(text: str) -> list[str]:
+    return [w for w in re.findall(r"[^\W\d_]+", norm(text)) if not _MONEY_WORD.match(w)]
+
+
+_MONEY_WORD = re.compile(r"(?i)^(?:руб\w*|р|доллар\w*|бакс\w*|евро|dollars?|bucks|usd|eur|rub\w*)$")
+
+
+def scaled_amount(value: str | None, context: Iterable[str]) -> str | None:
+    """A bare amount («полтора», "2.5") said where the amounts are thousands (the same message,
+    or the slot's earlier value): the number it means, «1500». None when the value carries its
+    own scale or the context has none."""
+    v = value or ""
+    if (
+        not v
+        or len(v) > 40
+        or _SCALED.search(v)
+        or re.search(r"(?i)тыс|млн|thousand|million|k\b", v)
+    ):
+        return None
+    n: float | None = None
+    frac_word = False
+    for pat, frac in _HALF:
+        m = pat.search(v)
+        if m:
+            n = frac if frac is not None else float(m.group(1).replace(",", "."))
+            frac_word = frac is not None
+            break
+    if n is None or n <= 0 or n >= 100 or not _MONEY.match(v):
+        return None
+    if frac_word and not all(w in _WORDY or not w.isalpha() for w in _plain_words(v)):
+        return None  # «полтора часа»: an amount of something else
+    ctx = list(context)
+    # a decimal leans on the slot's earlier value; a colloquial «полтора» also on its message
+    if not any(_SCALED.search(c or "") for c in (ctx if frac_word else ctx[1:])):
+        return None
+    return str(int(round(n * 1000)))
+
+
+def _settle_words(
+    rec: dict[str, Any], raw_text: str, names: Iterable[str], known: Iterable[dict[str, Any]]
+) -> None:
+    """The user's own fact for someone else gets that scope (it never retires the user's own
+    taste and stays out of the always-on core); a this-time-only taste is a one-off (it never
+    retires the habit); a bare amount in thousands gets its number (code-side value only)."""
+    quote, value = rec.get("quote_orig") or "", rec.get("value_text")
+    if rec.get("subject_id") == OWNER_ENTITY_ID and rec.get("fkind") not in ("plan", "condition"):
+        appl = dict(rec.get("applicability") or {})
+        fw = appl.get("for_whom")
+        if not (isinstance(fw, str) and fw.strip() and norm(fw) not in ("self", "user", "owner")):
+            who = for_other(quote, value, names)
+            if who:
+                appl.pop("unstated", None)
+                appl.pop("general", None)
+                appl["for_whom"] = who
+                rec["applicability"] = appl
+        if rec.get("stability") != "one_off" and just_once(
+            quote, value, preference=rec.get("kind") == "preference"
+        ):
+            rec["stability"] = "one_off"
+    slot = [
+        k.get("value_text") or ""
+        for k in known
+        if k.get("subject") == f"m:{rec.get('subject_id')}"
+        and k.get("relation") == rec.get("relation")
+    ]
+    n = scaled_amount(value, [raw_text, *slot])
+    if n is not None:
+        rec["value_norm"] = n
+        if rec.get("text_en") and n not in rec["text_en"]:
+            rec["text_en"] = f"{rec['text_en']} ({n})"
 
 
 def _retractions(
@@ -1055,6 +1435,165 @@ def _retractions(
                 continue
             out.dropped.append(f"retracted_in_batch:{t}")
             keep = [p for p in keep if p not in mine]
+    return keep
+
+
+_NOT_A_SIDE = frozenset(("только", "лишь", "просто", "only", "just", "merely", "simply"))
+# where a trailing old side ends: past its apposition commas, never past a new clause
+_CLAUSE_END = re.compile(
+    r"\s+(?:and|but|because|since|so|и|но|потому|чтобы)\s|\s+[-—–]\s|[;.!?\n]|:(?!\d)"
+)
+
+
+def _retired_regions(text: str) -> list[tuple[int, int]]:
+    """Where a correction's corrected-away side sits in a normalized raw (the ledger's own
+    contrast patterns: «не X, а Y», «Y, а не X», "not X but Y", "Y, not X"). When the old
+    side comes first it ends where its own words end; when it comes last it runs to the end
+    of the sentence («…, а не Женя Воронцова, соседка»: the apposition is that side too)."""
+    from .. import ledger
+
+    regions: list[tuple[int, int]] = []
+    for pat in ledger._RETIRING:
+        for m in pat.finditer(text):
+            if "new" in pat.groupindex and m.group("new").casefold() in ledger._AUX:
+                continue  # "it is not ready": a negated verb, not a replaced value
+            words = m.group("old").split()
+            if not words or words[0] in _NOT_A_SIDE:
+                continue  # «не только X, но и Y», "not only X but Y": both stand
+            a, b = m.span("old")
+            if b >= m.end():  # the old side is last: to the end of its sentence
+                end = _CLAUSE_END.search(text, b)
+                b = end.start() if end else len(text)
+            regions.append((a, b))
+    return regions
+
+
+def _corrected_away(
+    x: Extraction, raw_norm: dict[str, str]
+) -> tuple[set[str], Callable[..., bool]]:
+    """The side a correction corrects away is never a new fact. An affirmed fact
+    whose quote lies wholly inside that side («а не Женя Воронцова, соседка» → "she is a
+    neighbour") is dropped; the returned check tells whether every occurrence of the given
+    names in the batch sits on such a side or in such a dropped quote, so a kind word or a
+    person named only there is not created either. A negated fact is left to `_corrections`."""
+    zones = {rid: _retired_regions(t) for rid, t in raw_norm.items()}
+    away: set[str] = set()
+    extra: dict[str, list[tuple[int, int]]] = {}
+    for f in x.facts:
+        t, q = raw_norm.get(f.source_raw_id), norm(f.quote_orig)
+        if f.polarity is not Polarity.AFFIRMED or not t or not q:
+            continue
+        i = t.find(q)
+        if i >= 0 and any(a <= i and i + len(q) <= b for a, b in zones[f.source_raw_id]):
+            away.add(f.ref)
+            extra.setdefault(f.source_raw_id, []).append((i, i + len(q)))
+    for rid, spans in extra.items():
+        zones[rid] = zones[rid] + spans
+
+    def dead_in(*names: str) -> bool:
+        seen = False
+        for n in {norm(n) for n in names if norm(n)}:
+            for rid, t in raw_norm.items():
+                i = t.find(n)
+                while i >= 0:
+                    seen = True
+                    if not any(a <= i and i + len(n) <= b for a, b in zones[rid]):
+                        return False
+                    i = t.find(n, i + 1)
+        return seen
+
+    return away, dead_in
+
+
+def _omitted_replaces(
+    facts: list[XFact],
+    raws: dict[str, dict[str, Any]],
+    known_f: dict[str, dict[str, Any]],
+    who: Callable[[str | None, dict[str, Any]], str | None],
+    out: Built,
+) -> list[XFact]:
+    """A later change the model returned without `replaces` («конференция 23–24 октября»
+    after «…16–17 октября») names the earlier record of the same subject and relation: a
+    scalar value (dates, numbers, contacts) of the same kind, the same words around it, a
+    different value, by the same speaker. An earlier message of the batch comes first (its
+    time is known), else the newest known fact. `replaces` only proposes the match: the
+    ledger's own rule and its review decide what retires (§8.3); another person's claim is
+    never named (a correction never retires someone else's word)."""
+    from .. import ledger
+
+    def kind_of(v: str | None) -> tuple[frozenset[str], set[str], list[str]] | None:
+        toks = ledger.value_tokens(v or "")
+        if not toks:
+            return None
+        rest = [w for w in _value_words(v) if not any(c.isdigit() for c in w)]
+        return frozenset(t.split(":", 1)[0] for t in toks), toks, rest
+
+    def same_rest(a: list[str], b: list[str]) -> bool:
+        if not a and not b:
+            return True
+        return (
+            bool(a and b)
+            and _same_value(" ".join(a), " ".join(b))
+            and _same_value(" ".join(b), " ".join(a))
+        )
+
+    def speaker(f: XFact) -> str | None:
+        raw = raws.get(f.source_raw_id) or {}
+        return who(f.speaker, raw) if f.speaker else raw.get("speaker")
+
+    def change(n: XFact, nk: Any, old_value: str | None, old_rel: str | None) -> bool:
+        ok = kind_of(old_value)
+        return (
+            ok is not None
+            and old_rel == n.relation
+            and ok[0] == nk[0]
+            and ok[1] != nk[1]
+            and same_rest(ok[2], nk[2])
+            and (n.relation != "other" or bool(nk[2]))  # a bare date under `other`: no slot
+        )
+
+    keep = list(facts)
+    for k_, n in enumerate(keep):
+        raw = raws.get(n.source_raw_id)
+        nk = kind_of(n.value_text)
+        if (
+            raw is None
+            or nk is None
+            or n.replaces is not None
+            or n.polarity is not Polarity.AFFIRMED
+            or (n.stability is not None and n.stability.value == "one_off")
+        ):
+            continue
+        s, spk, rank = who(n.subject, raw), speaker(n), tier_rank(AuthorTier(raw["tier"]))
+        if s is None or spk is None:
+            continue
+        old: str | None = None
+        earlier = [
+            e
+            for e in keep
+            if e.ref != n.ref
+            and e.polarity is Polarity.AFFIRMED
+            and e.source_raw_id in raws
+            and raws[e.source_raw_id]["ts"] < raw["ts"]
+            and who(e.subject, raws[e.source_raw_id]) == s
+            and speaker(e) == spk
+            and tier_rank(AuthorTier(raws[e.source_raw_id]["tier"])) <= rank
+            and change(n, nk, e.value_text, e.relation)
+        ]
+        if earlier:
+            old = max(earlier, key=lambda e: raws[e.source_raw_id]["ts"]).ref
+        else:
+            for k in known_f.values():  # newest first
+                if (
+                    k.get("subject") == f"m:{s}"
+                    and k.get("speaker") == spk
+                    and tier_rank(AuthorTier(k.get("tier") or "other")) <= rank
+                    and change(n, nk, k.get("value_text"), k.get("relation"))
+                ):
+                    old = k["handle"]
+                    break
+        if old is not None:
+            keep[k_] = n.model_copy(update={"replaces": old})
     return keep
 
 
