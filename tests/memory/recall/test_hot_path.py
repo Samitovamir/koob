@@ -75,18 +75,29 @@ def test_vectors_absent_still_recalls(conn, monkeypatch):
 
 
 def test_slow_embedder_is_skipped_past_its_deadline(conn, monkeypatch):
-    """§10.2: vector 40 ms, skipped past it; the other finders still answer."""
-    import time
+    """§10.2: vector 40 ms, skipped past it; the other finders still answer.
+
+    The embedder blocks until the test releases it, so it is slower than any deadline
+    whatever the machine load: recall must return without its answer, and the outcome
+    does not hang on wall-clock thresholds."""
+    import threading
+
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
 
     class Slow(vectors.HashEmbedder):
         def embed_query(self, text):
-            time.sleep(0.3)
+            started.set()
+            release.wait(timeout=30)
+            finished.set()
             return super().embed_query(text)
 
     vectors.set_embedder(Slow())
     monkeypatch.setattr(vectors, "_embedder_for", lambda _id: Slow())
     turn = TurnCtx(turn_id="t3", thread_id="th-3", owner_words="что про Сашу")
-    t0 = time.perf_counter()
-    b = api.recall(turn, store=conn)
-    assert (time.perf_counter() - t0) * 1000 < 150
+    try:
+        b = api.recall(turn, store=conn)
+        assert started.is_set(), "the vector lane never asked the embedder"
+        assert not finished.is_set(), "recall waited for the slow embedder"
+    finally:
+        release.set()
     assert [i.id for i in b.items] == ["f-bday"]

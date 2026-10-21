@@ -14,7 +14,7 @@ from koob.memory import api, forget
 from koob.memory.model import AuthorTier, TurnCtx, TurnOrigin
 from koob.memory.recall import basket, core_view, vectors
 
-from .._ledger import add, entity, fact, open_seeded, status
+from .._ledger import DayClock, add, entity, fact, open_seeded, status
 from ..recall.test_raw_meaning_lane import ConceptEmbedder
 
 CLOCK = "2026-10-12T12:00:00.000000Z"
@@ -29,7 +29,7 @@ def conn(tmp_path):
     basket._NO_REVISION.clear()
     forget.reset_wiring()
     forget.use_key(None)
-    forget.wire(stop_hooks=[vectors.stop_hook])
+    forget.wire(stop_hooks=[vectors.stop_hook], clock=DayClock())
     c = open_seeded(tmp_path)
     vectors.attach(tmp_path / "vectors.db")
     yield c

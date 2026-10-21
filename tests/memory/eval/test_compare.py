@@ -218,6 +218,7 @@ def test_graphiti_view_shows_invalidated_facts_as_history():
 
 
 def test_graphiti_budget_caps_per_scenario_and_run():
+    pytest.importorskip("graphiti_core", reason="graphiti-core is an optional extra")
     from koob.memory.eval import graphiti_llm as gl
 
     b = gl.Budget(per_scenario=2, total=3)
@@ -238,6 +239,7 @@ def test_graphiti_budget_caps_per_scenario_and_run():
 def test_subscription_llm_calls_once_caches_and_retries(tmp_path):
     import asyncio
 
+    pytest.importorskip("graphiti_core", reason="graphiti-core is an optional extra")
     from graphiti_core.prompts.models import Message
 
     from koob.memory.eval import graphiti_llm as gl

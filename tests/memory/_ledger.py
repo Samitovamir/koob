@@ -6,6 +6,7 @@ writers and workers commit (§6.3)."""
 from __future__ import annotations
 
 import itertools
+from datetime import UTC, datetime
 from typing import Any
 
 from koob.memory import ledger, store
@@ -24,6 +25,23 @@ from koob.memory.model import (
 )
 
 _clock = itertools.count(1)
+
+TEST_DAY = datetime(2026, 10, 12, 9, 0, tzinfo=UTC)
+
+
+class DayClock:
+    """Real time, shifted so that the run starts at `TEST_DAY`, the day `ts()` stamps.
+
+    The always-on core keeps only the recently active people and the things that apply
+    today, so a test that stamps records with a fixed date and reads the core on the real
+    date would fail a week later. Leases, waits and timing still move as before; only the
+    day is pinned."""
+
+    def __init__(self) -> None:
+        self._shift = TEST_DAY - datetime.now(UTC)
+
+    def now(self) -> datetime:
+        return datetime.now(UTC) + self._shift
 
 
 def ts() -> str:
